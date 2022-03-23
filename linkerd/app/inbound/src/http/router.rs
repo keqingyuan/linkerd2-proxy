@@ -100,6 +100,7 @@ impl<C> Inbound<C> {
                 .check_service::<Http>()
                 .push(transport::metrics::Client::layer(rt.metrics.proxy.transport.clone()))
                 .check_service::<Http>()
+                .push_map_target(|(_version, target)| target)
                 .push(http::client::layer(
                     config.proxy.connect.h1_settings,
                     config.proxy.connect.h2_settings,
@@ -395,7 +396,7 @@ impl tap::Inspect for Logical {
         req.extensions()
             .get::<tls::ConditionalServerTls>()
             .cloned()
-            .unwrap_or_else(|| tls::ConditionalServerTls::None(tls::NoServerTls::Disabled))
+            .unwrap_or(tls::ConditionalServerTls::None(tls::NoServerTls::Disabled))
     }
 
     fn dst_addr<B>(&self, _: &http::Request<B>) -> Option<SocketAddr> {
