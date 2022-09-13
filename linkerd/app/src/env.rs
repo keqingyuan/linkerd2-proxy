@@ -218,6 +218,9 @@ const ENV_INITIAL_STREAM_WINDOW_SIZE: &str = "LINKERD2_PROXY_HTTP2_INITIAL_STREA
 const ENV_INITIAL_CONNECTION_WINDOW_SIZE: &str =
     "LINKERD2_PROXY_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE";
 
+const ENV_INBOUND_HTTP1_CONNECTION_POOL_IDLE_TIMEOUT: &str =
+    "LINKERD2_PROXY_INBOUND_HTTP1_CONNECTION_POOL_IDLE_TIMEOUT";
+
 // Default values for various configuration fields
 const DEFAULT_OUTBOUND_LISTEN_ADDR: &str = "127.0.0.1:4140";
 pub const DEFAULT_INBOUND_LISTEN_ADDR: &str = "0.0.0.0:4143";
@@ -227,19 +230,13 @@ const DEFAULT_METRICS_RETAIN_IDLE: Duration = Duration::from_secs(10 * 60);
 const DEFAULT_INBOUND_DISPATCH_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_INBOUND_DETECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_INBOUND_CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
-const DEFAULT_INBOUND_CONNECT_BACKOFF: ExponentialBackoff = ExponentialBackoff {
-    min: Duration::from_millis(100),
-    max: Duration::from_millis(500),
-    jitter: 0.1,
-};
+const DEFAULT_INBOUND_CONNECT_BACKOFF: ExponentialBackoff =
+    ExponentialBackoff::new_unchecked(Duration::from_millis(100), Duration::from_millis(500), 0.1);
 const DEFAULT_OUTBOUND_DISPATCH_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_OUTBOUND_DETECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
-const DEFAULT_OUTBOUND_CONNECT_BACKOFF: ExponentialBackoff = ExponentialBackoff {
-    min: Duration::from_millis(100),
-    max: Duration::from_millis(500),
-    jitter: 0.1,
-};
+const DEFAULT_OUTBOUND_CONNECT_BACKOFF: ExponentialBackoff =
+    ExponentialBackoff::new_unchecked(Duration::from_millis(100), Duration::from_millis(500), 0.1);
 const DEFAULT_RESOLV_CONF: &str = "/etc/resolv.conf";
 
 const DEFAULT_INITIAL_STREAM_WINDOW_SIZE: u32 = 65_535; // Protocol default
@@ -258,6 +255,13 @@ const DEFAULT_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 1048576; // 1MB ~ 16 streams
 // the number of endpoints should generally be pretty constrained.
 const DEFAULT_INBOUND_ROUTER_MAX_IDLE_AGE: Duration = Duration::from_secs(20);
 const DEFAULT_OUTBOUND_ROUTER_MAX_IDLE_AGE: Duration = Duration::from_secs(5);
+
+// XXX This default inbound connection idle timeout should be less than or equal
+// to the server's idle timeout so that we don't try to reuse a connection as it
+// is being timed out of the server.
+//
+// In the future this should be made configurable per-server from the proxy API.
+const DEFAULT_INBOUND_HTTP1_CONNECTION_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 
 // By default, we don't limit the number of connections a connection pol may
 // use, as doing so can severely impact CPU utilization for applications with
@@ -501,6 +505,12 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
             inbound_cache_max_idle_age?.unwrap_or(DEFAULT_INBOUND_ROUTER_MAX_IDLE_AGE);
         let max_idle =
             inbound_max_idle_per_endpoint?.unwrap_or(DEFAULT_INBOUND_MAX_IDLE_CONNS_PER_ENDPOINT);
+        let connection_pool_timeout = parse(
+            strings,
+            ENV_INBOUND_HTTP1_CONNECTION_POOL_IDLE_TIMEOUT,
+            parse_duration,
+        )?
+        .unwrap_or(DEFAULT_INBOUND_HTTP1_CONNECTION_POOL_IDLE_TIMEOUT);
         let keepalive = Keepalive(inbound_connect_keepalive?);
         let connect = ConnectConfig {
             keepalive,
@@ -513,7 +523,7 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
             h2_settings,
             h1_settings: h1::PoolSettings {
                 max_idle,
-                idle_timeout: cache_max_idle_age,
+                idle_timeout: connection_pool_timeout,
             },
         };
 
@@ -969,8 +979,10 @@ fn parse_addr(s: &str) -> Result<Addr, ParseError> {
 
 fn parse_port_set(s: &str) -> Result<HashSet<u16>, ParseError> {
     let mut set = HashSet::new();
-    for num in s.split(',') {
-        set.insert(parse_number::<u16>(num)?);
+    if !s.is_empty() {
+        for num in s.split(',') {
+            set.insert(parse_number::<u16>(num)?);
+        }
     }
     Ok(set)
 }
@@ -1098,7 +1110,7 @@ pub fn parse_backoff<S: Strings>(
     match (min?, max?, jitter?) {
         (None, None, None) => Ok(default),
         (Some(min), Some(max), jitter) => {
-            ExponentialBackoff::new(min, max, jitter.unwrap_or_default()).map_err(|error| {
+            ExponentialBackoff::try_new(min, max, jitter.unwrap_or_default()).map_err(|error| {
                 error!(message="Invalid backoff", %error, %min_env, ?min, %max_env, ?max, %jitter_env, ?jitter);
                 EnvError::InvalidEnvVar
             })

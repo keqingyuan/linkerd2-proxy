@@ -64,13 +64,8 @@ impl Config {
             let backoff = self.connect.backoff;
             move |error: Error| {
                 warn!(%error, "Failed to resolve control-plane component");
-                if let Some(e) = error.downcast_ref::<dns::ResolveError>() {
-                    if let dns::ResolveErrorKind::NoRecordsFound {
-                        negative_ttl: Some(ttl_secs),
-                        ..
-                    } = e.kind()
-                    {
-                        let ttl = time::Duration::from_secs(*ttl_secs as u64);
+                if let Some(e) = crate::errors::caused_by::<dns::ResolveError>(&*error) {
+                    if let Some(ttl) = e.negative_ttl() {
                         return Ok(Either::Left(
                             IntervalStream::new(time::interval(ttl)).map(|_| ()),
                         ));
@@ -86,6 +81,7 @@ impl Config {
         svc::stack(ConnectTcp::new(self.connect.keepalive))
             .push(tls::Client::layer(identity))
             .push_connect_timeout(self.connect.timeout)
+            .push_map_target(|(_version, target)| target)
             .push(self::client::layer())
             .push_on_service(svc::MapErr::layer(Into::into))
             .into_new_service()

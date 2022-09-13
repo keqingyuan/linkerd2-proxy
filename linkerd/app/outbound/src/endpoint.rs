@@ -14,7 +14,7 @@ use std::{
     sync::Arc,
 };
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Endpoint<P> {
     pub addr: Remote<ServerAddr>,
     pub tls: tls::ConditionalClientTls,
@@ -33,13 +33,17 @@ pub struct FromMetadata {
 // === impl Endpoint ===
 
 impl Endpoint<()> {
-    pub(crate) fn forward(addr: OrigDstAddr, reason: tls::NoClientTls) -> Self {
+    pub(crate) fn forward(
+        addr: OrigDstAddr,
+        reason: tls::NoClientTls,
+        opaque_protocol: bool,
+    ) -> Self {
         Self {
             addr: Remote(ServerAddr(addr.into())),
             metadata: Metadata::default(),
             tls: Conditional::None(reason),
             logical_addr: None,
-            opaque_protocol: false,
+            opaque_protocol,
             protocol: (),
         }
     }
@@ -137,15 +141,6 @@ impl<P> svc::Param<metrics::EndpointLabels> for Endpoint<P> {
     }
 }
 
-impl<P: std::hash::Hash> std::hash::Hash for Endpoint<P> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.addr.hash(state);
-        self.tls.hash(state);
-        self.logical_addr.hash(state);
-        self.protocol.hash(state);
-    }
-}
-
 // === EndpointFromMetadata ===
 impl FromMetadata {
     fn client_tls(metadata: &Metadata, reason: tls::NoClientTls) -> tls::ConditionalClientTls {
@@ -224,7 +219,7 @@ impl<S> Outbound<S> {
     {
         let http = self
             .clone()
-            .push_tcp_endpoint::<http::Endpoint>()
+            .push_tcp_endpoint::<http::Connect>()
             .push_http_endpoint()
             .push_http_server()
             .into_inner();
@@ -269,6 +264,7 @@ pub mod tests {
                 .new_service(tcp::Endpoint::forward(
                     OrigDstAddr(addr),
                     tls::NoClientTls::Disabled,
+                    false,
                 ));
 
             let (client_io, server_io) = support::io::duplex(4096);

@@ -4,7 +4,7 @@ use crate::{
 };
 use futures::prelude::*;
 use http::{
-    header::{CONNECTION, HOST, UPGRADE},
+    header::{CONNECTION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING, UPGRADE},
     uri::{Authority, Parts, Scheme, Uri},
 };
 use linkerd_error::{Error, Result};
@@ -65,7 +65,7 @@ type RspFuture = Pin<Box<dyn Future<Output = Result<http::Response<BoxBody>>> + 
 impl<C, T, B> Client<C, T, B>
 where
     T: Clone + Send + Sync + 'static,
-    C: tower::make::MakeConnection<T> + Clone + Send + Sync + 'static,
+    C: tower::make::MakeConnection<(crate::Version, T)> + Clone + Send + Sync + 'static,
     C::Connection: Unpin + Send + 'static,
     C::Future: Unpin + Send + 'static,
     C::Error: Into<Error>,
@@ -140,6 +140,16 @@ where
                     "Upgrade extension must be set on CONNECT requests"
                 );
                 rsp.extensions_mut().insert(HttpConnect);
+
+                // Strip headers that may not be transmitted to the server, per
+                // https://tools.ietf.org/html/rfc7231#section-4.3.6:
+                //
+                // A client MUST ignore any Content-Length or Transfer-Encoding
+                // header fields received in a successful response to CONNECT.
+                if rsp.status().is_success() {
+                    rsp.headers_mut().remove(CONTENT_LENGTH);
+                    rsp.headers_mut().remove(TRANSFER_ENCODING);
+                }
             }
 
             if is_upgrade(&rsp) {
@@ -231,8 +241,20 @@ pub(crate) fn wants_upgrade<B>(req: &http::Request<B>) -> bool {
 
 /// Checks responses to determine if they are successful HTTP upgrades.
 pub(crate) fn is_upgrade<B>(res: &http::Response<B>) -> bool {
+    #[inline]
+    fn is_connect_success<B>(res: &http::Response<B>) -> bool {
+        res.extensions().get::<HttpConnect>().is_some() && res.status().is_success()
+    }
+
     // Upgrades were introduced in HTTP/1.1
     if res.version() != http::Version::HTTP_11 {
+        if is_connect_success(res) {
+            tracing::warn!(
+                "A successful response to a CONNECT request had an incorrect HTTP version \
+                (expected HTTP/1.1, got {:?})",
+                res.version()
+            );
+        }
         return false;
     }
 
@@ -242,7 +264,7 @@ pub(crate) fn is_upgrade<B>(res: &http::Response<B>) -> bool {
     }
 
     // CONNECT requests are complete if status code is 2xx.
-    if res.extensions().get::<HttpConnect>().is_some() && res.status().is_success() {
+    if is_connect_success(res) {
         return true;
     }
 

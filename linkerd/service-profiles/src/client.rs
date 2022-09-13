@@ -10,7 +10,7 @@ use std::{
     task::{Context, Poll},
 };
 use tonic::{body::BoxBody, client::GrpcService};
-use tracing::debug;
+use tracing::{debug, trace};
 
 /// Creates watches on service profiles.
 #[derive(Clone, Debug)]
@@ -31,7 +31,7 @@ impl<R, S> Client<R, S>
 where
     S: GrpcService<BoxBody> + Clone + Send + 'static,
     S::ResponseBody: Send + Sync,
-    <S::ResponseBody as Body>::Data: Send,
+    S::ResponseBody: Default + Body<Data = tonic::codegen::Bytes> + Send + 'static,
     <S::ResponseBody as Body>::Error:
         Into<Box<dyn std::error::Error + Send + Sync + 'static>> + Send,
     S::Future: Send,
@@ -49,8 +49,7 @@ impl<T, R, S> Service<T> for Client<R, S>
 where
     T: Param<LookupAddr>,
     S: GrpcService<BoxBody> + Clone + Send + 'static,
-    S::ResponseBody: Send + Sync,
-    <S::ResponseBody as Body>::Data: Send,
+    S::ResponseBody: Default + Body<Data = tonic::codegen::Bytes> + Send + 'static,
     <S::ResponseBody as Body>::Error:
         Into<Box<dyn std::error::Error + Send + Sync + 'static>> + Send,
     S::Future: Send,
@@ -74,7 +73,9 @@ where
         Box::pin(async move {
             match w.spawn_watch(addr).await {
                 Ok(rsp) => {
+                    debug!("Resolved profile");
                     let rx = rsp.into_inner();
+                    trace!(profile = ?rx.borrow());
                     Ok(Some(rx.into()))
                 }
                 Err(status) => {
@@ -96,8 +97,7 @@ type InnerFuture =
 impl<S> Inner<S>
 where
     S: GrpcService<BoxBody> + Clone + Send + 'static,
-    S::ResponseBody: Send + Sync,
-    <S::ResponseBody as Body>::Data: Send,
+    S::ResponseBody: Default + Body<Data = tonic::codegen::Bytes> + Send + 'static,
     <S::ResponseBody as Body>::Error:
         Into<Box<dyn std::error::Error + Send + Sync + 'static>> + Send,
     S::Future: Send,
@@ -113,8 +113,7 @@ where
 impl<S> Service<LookupAddr> for Inner<S>
 where
     S: GrpcService<BoxBody> + Clone + Send + 'static,
-    S::ResponseBody: Send + Sync,
-    <S::ResponseBody as Body>::Data: Send,
+    S::ResponseBody: Default + Body<Data = tonic::codegen::Bytes> + Send + 'static,
     <S::ResponseBody as Body>::Error:
         Into<Box<dyn std::error::Error + Send + Sync + 'static>> + Send,
     S::Future: Send,

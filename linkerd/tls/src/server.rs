@@ -11,6 +11,7 @@ use linkerd_io::{self as io, AsyncReadExt, EitherIo, PrefixedIo};
 use linkerd_stack::{layer, ExtractParam, InsertParam, NewService, Param};
 use std::{
     fmt,
+    ops::Deref,
     pin::Pin,
     str::FromStr,
     sync::Arc,
@@ -94,12 +95,13 @@ pub struct DetectTls<T, P, L, N> {
     inner: N,
 }
 
-// The initial peek buffer is statically allocated on the stack and is fairly small; but it is
-// large enough to hold the ~300B ClientHello sent by proxies.
+// The initial peek buffer is fairly small so that we can avoid allocating more
+// data then we need; but it is large enough to hold the ~300B ClientHello sent
+// by proxies.
 const PEEK_CAPACITY: usize = 512;
 
-// A larger fallback buffer is allocated onto the heap if the initial peek buffer is
-// insufficient. This is the same value used in HTTP detection.
+// A larger fallback buffer is allocated onto the heap if the initial peek
+// buffer is insufficient. This is the same value used in HTTP detection.
 const BUFFER_CAPACITY: usize = 8192;
 
 impl<P, L, N> NewDetectTls<P, L, N> {
@@ -218,18 +220,18 @@ async fn detect_sni<I>(mut io: I) -> io::Result<(Option<ServerId>, DetectIo<I>)>
 where
     I: io::Peek + io::AsyncRead + io::AsyncWrite + Send + Sync + Unpin,
 {
-    // First, try to use MSG_PEEK to read the SNI from the TLS ClientHello.
-    // Because peeked data does not need to be retained, we use a static
-    // buffer to prevent needless heap allocation.
+    // First, try to use MSG_PEEK to read the SNI from the TLS ClientHello. We
+    // use a heap-allocated buffer to avoid creating a large `Future` (since we
+    // need to hold the buffer across an await).
     //
-    // Anecdotally, the ClientHello sent by Linkerd proxies is <300B. So a
-    // ~500B byte buffer is more than enough.
-    let mut buf = [0u8; PEEK_CAPACITY];
+    // Anecdotally, the ClientHello sent by Linkerd proxies is <300B. So a ~500B
+    // byte buffer is more than enough.
+    let mut buf = BytesMut::with_capacity(PEEK_CAPACITY);
     let sz = io.peek(&mut buf).await?;
     debug!(sz, "Peeked bytes from TCP stream");
     // Peek may return 0 bytes if the socket is not peekable.
     if sz > 0 {
-        match client_hello::parse_sni(&buf) {
+        match client_hello::parse_sni(buf.as_ref()) {
             Ok(sni) => {
                 return Ok((sni, EitherIo::Left(io)));
             }
@@ -304,7 +306,12 @@ fn client_identity<S>(tls: &TlsStream<S>) -> Option<ClientId> {
 
     match dns_names.first()? {
         GeneralDNSNameRef::DNSName(n) => {
-            Some(ClientId(id::Name::from(dns::Name::from(n.to_owned()))))
+            // Unfortunately we have to allocate a new string here, since there's no way to get the
+            // underlying bytes from a `DNSNameRef`.
+            let name = AsRef::<str>::as_ref(&n.to_owned())
+                .parse::<dns::Name>()
+                .ok()?;
+            Some(ClientId(name.into()))
         }
         GeneralDNSNameRef::Wildcard(_) => {
             // Wildcards can perhaps be handled in a future path...
@@ -327,8 +334,10 @@ impl From<ClientId> for id::Name {
     }
 }
 
-impl AsRef<id::Name> for ClientId {
-    fn as_ref(&self) -> &id::Name {
+impl Deref for ClientId {
+    type Target = id::Name;
+
+    fn deref(&self) -> &id::Name {
         &self.0
     }
 }
@@ -371,13 +380,13 @@ mod tests {
         let _trace = linkerd_tracing::test::trace_init();
 
         let (mut client_io, server_io) = tokio::io::duplex(1024);
-        let input = include_bytes!("testdata/curl-example-com-client-hello.bin");
+        let input = include_bytes!("server/testdata/curl-example-com-client-hello.bin");
         let len = input.len();
         let client_task = tokio::spawn(async move {
             client_io
                 .write_all(&*input)
                 .await
-                .expect("Write must suceed");
+                .expect("Write must succeed");
         });
 
         let (sni, io) = detect_sni(server_io)
