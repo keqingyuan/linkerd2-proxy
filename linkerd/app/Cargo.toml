@@ -13,6 +13,8 @@ This is used by tests and the executable.
 
 [features]
 allow-loopback = ["linkerd-app-outbound/allow-loopback"]
+log-streaming = ["linkerd-app-admin/log-streaming"]
+pprof = ["linkerd-app-admin/pprof"]
 
 [dependencies]
 futures = { version = "0.3", default-features = false }
@@ -23,10 +25,12 @@ linkerd-app-inbound = { path = "./inbound" }
 linkerd-app-outbound = { path = "./outbound" }
 linkerd-error = { path = "../error" }
 linkerd-opencensus = { path = "../opencensus" }
+linkerd-tonic-stream = { path = "../tonic-stream" }
+rangemap = "1"
 regex = "1"
 thiserror = "1"
 tokio = { version = "1", features = ["rt"] }
 tokio-stream = { version = "0.1", features = ["time", "sync"] }
-tonic = { version = "0.6", default-features = false, features = ["prost"] }
+tonic = { version = "0.10", default-features = false, features = ["prost"] }
 tower = "0.4"
 tracing = "0.1"

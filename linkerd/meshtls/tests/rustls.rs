@@ -1,15 +1,15 @@
 #![cfg(feature = "rustls")]
-#![deny(
-    warnings,
-    rust_2018_idioms,
-    clippy::disallowed_methods,
-    clippy::disallowed_types
-)]
+#![deny(rust_2018_idioms, clippy::disallowed_methods, clippy::disallowed_types)]
 #![forbid(unsafe_code)]
 
 mod util;
 
 use linkerd_meshtls::Mode;
+
+#[test]
+fn fails_processing_cert_when_wrong_id_configured() {
+    util::fails_processing_cert_when_wrong_id_configured(Mode::Rustls);
+}
 
 #[tokio::test(flavor = "current_thread")]
 async fn plaintext() {

@@ -1,32 +1,31 @@
 //! Configures and executes the proxy
 
-#![deny(
-    warnings,
-    rust_2018_idioms,
-    clippy::disallowed_methods,
-    clippy::disallowed_types
-)]
+#![deny(rust_2018_idioms, clippy::disallowed_methods, clippy::disallowed_types)]
+#![allow(opaque_hidden_inferred_bound)]
 #![forbid(unsafe_code)]
 
 pub mod dst;
 pub mod env;
 pub mod identity;
 pub mod oc_collector;
+pub mod policy;
+pub mod spire;
 pub mod tap;
 
 pub use self::metrics::Metrics;
 use futures::{future, Future, FutureExt};
 use linkerd_app_admin as admin;
-pub use linkerd_app_core::{self as core, metrics, trace};
 use linkerd_app_core::{
     config::ServerConfig,
-    control::ControlAddr,
+    control::{ControlAddr, Metrics as ControlMetrics},
     dns, drain,
-    metrics::FmtMetrics,
+    metrics::{prom, FmtMetrics},
+    serve,
     svc::Param,
-    transport::{listen::Bind, ClientAddr, Local, OrigDstAddr, Remote, ServerAddr},
+    transport::{addrs::*, listen::Bind},
     Error, ProxyRuntime,
 };
+pub use linkerd_app_core::{metrics, trace, transport::BindTcp, BUILD_INFO};
 use linkerd_app_gateway as gateway;
 use linkerd_app_inbound::{self as inbound, Inbound};
 use linkerd_app_outbound::{self as outbound, Outbound};
@@ -58,9 +57,16 @@ pub struct Config {
     pub dns: dns::Config,
     pub identity: identity::Config,
     pub dst: dst::Config,
+    pub policy: policy::Config,
     pub admin: admin::Config,
     pub tap: tap::Config,
     pub oc_collector: oc_collector::Config,
+
+    /// Grace period for graceful shutdowns.
+    ///
+    /// If the proxy does not shut down gracefully within this timeout, it will
+    /// terminate forcefully, closing any remaining connections.
+    pub shutdown_grace_period: time::Duration,
 }
 
 pub struct App {
@@ -93,88 +99,199 @@ impl Config {
         bind_admin: BAdmin,
         shutdown_tx: mpsc::UnboundedSender<()>,
         log_level: trace::Handle,
+        mut registry: prom::Registry,
     ) -> Result<App, Error>
     where
         BIn: Bind<ServerConfig> + 'static,
-        BIn::Addrs: Param<Remote<ClientAddr>> + Param<Local<ServerAddr>> + Param<OrigDstAddr>,
+        BIn::Addrs: Param<Remote<ClientAddr>>
+            + Param<Local<ServerAddr>>
+            + Param<OrigDstAddr>
+            + Param<AddrPair>,
         BOut: Bind<ServerConfig> + 'static,
-        BOut::Addrs: Param<Remote<ClientAddr>> + Param<Local<ServerAddr>> + Param<OrigDstAddr>,
+        BOut::Addrs: Param<Remote<ClientAddr>>
+            + Param<Local<ServerAddr>>
+            + Param<OrigDstAddr>
+            + Param<AddrPair>,
         BAdmin: Bind<ServerConfig> + Clone + 'static,
-        BAdmin::Addrs: Param<Remote<ClientAddr>> + Param<Local<ServerAddr>>,
+        BAdmin::Addrs: Param<Remote<ClientAddr>> + Param<Local<ServerAddr>> + Param<AddrPair>,
     {
         let Config {
             admin,
             dns,
             dst,
+            policy,
             identity,
             inbound,
             oc_collector,
             outbound,
             gateway,
             tap,
+            ..
         } = self;
-        debug!("building app");
+        debug!("Building app");
         let (metrics, report) = Metrics::new(admin.metrics_retain_idle);
 
+        debug!("Building DNS client");
         let dns = dns.build();
 
         // Ensure that we've obtained a valid identity before binding any servers.
-        let identity = info_span!("identity")
-            .in_scope(|| identity.build(dns.resolver.clone(), metrics.control.clone()))?;
+        debug!("Building Identity client");
+        let identity = {
+            let id_metrics = identity::IdentityMetrics::register(
+                registry.sub_registry_with_prefix("control_identity"),
+            );
 
-        let report = identity.metrics().and_report(report);
+            info_span!("identity").in_scope(|| {
+                identity.build(dns.resolver.clone(), metrics.control.clone(), id_metrics)
+            })?
+        };
 
         let (drain_tx, drain_rx) = drain::channel();
 
+        debug!(config = ?tap, "Building Tap server");
         let tap = {
             let bind = bind_admin.clone();
             info_span!("tap")
                 .in_scope(|| tap.build(bind, identity.receiver().server(), drain_rx.clone()))?
         };
 
+        debug!("Building Destination client");
         let dst = {
+            let control_metrics =
+                ControlMetrics::register(registry.sub_registry_with_prefix("control_destination"));
             let metrics = metrics.control.clone();
             let dns = dns.resolver.clone();
-            info_span!("dst").in_scope(|| dst.build(dns, metrics, identity.receiver().new_client()))
+            info_span!("dst").in_scope(|| {
+                dst.build(
+                    dns,
+                    metrics,
+                    control_metrics,
+                    identity.receiver().new_client(),
+                )
+            })
         }?;
 
-        let oc_collector = {
-            let identity = identity.receiver().new_client();
+        debug!("Building Policy client");
+        let policies = {
+            let control_metrics =
+                ControlMetrics::register(registry.sub_registry_with_prefix("control_policy"));
             let dns = dns.resolver.clone();
+            let metrics = metrics.control.clone();
+            info_span!("policy").in_scope(|| {
+                policy.build(
+                    dns,
+                    metrics,
+                    control_metrics,
+                    identity.receiver().new_client(),
+                )
+            })
+        }?;
+
+        debug!(config = ?oc_collector, "Building client");
+        let oc_collector = {
+            let control_metrics =
+                ControlMetrics::register(registry.sub_registry_with_prefix("opencensus"));
+            let identity = identity.receiver().new_client();
+            let dns = dns.resolver;
             let client_metrics = metrics.control.clone();
             let metrics = metrics.opencensus;
-            info_span!("opencensus")
-                .in_scope(|| oc_collector.build(identity, dns, metrics, client_metrics))
+            info_span!("opencensus").in_scope(|| {
+                oc_collector.build(identity, dns, metrics, control_metrics, client_metrics)
+            })
         }?;
 
         let runtime = ProxyRuntime {
             identity: identity.receiver(),
-            metrics: metrics.proxy.clone(),
+            metrics: metrics.proxy,
             tap: tap.registry(),
             span_sink: oc_collector.span_sink(),
             drain: drain_rx.clone(),
         };
         let inbound = Inbound::new(inbound, runtime.clone());
-        let outbound = Outbound::new(outbound, runtime);
+        let outbound = Outbound::new(
+            outbound,
+            runtime,
+            registry.sub_registry_with_prefix("outbound"),
+        );
 
-        let inbound_policies = {
-            let dns = dns.resolver;
-            let metrics = metrics.control;
-            info_span!("policy").in_scope(|| inbound.build_policies(dns, metrics))
+        let inbound_policies = inbound.build_policies(
+            policies.workload.clone(),
+            policies.client.clone(),
+            policies.backoff,
+            policies.limits,
+        );
+
+        let outbound_policies = outbound.build_policies(
+            policies.workload.clone(),
+            policies.client.clone(),
+            policies.backoff,
+            policies.limits,
+        );
+
+        let dst_addr = dst.addr.clone();
+        // registry.sub_registry_with_prefix("gateway"),
+
+        let gateway = gateway::Gateway::new(gateway, inbound.clone(), outbound.clone()).stack(
+            dst.resolve.clone(),
+            dst.profiles.clone(),
+            outbound_policies.clone(),
+        );
+
+        // Bind the proxy sockets eagerly (so they're reserved and known) but defer building the
+        // stacks until the proxy starts running.
+        let (inbound_addr, inbound_listen) = bind_in
+            .bind(&inbound.config().proxy.server)
+            .expect("Failed to bind inbound listener");
+        let inbound_metrics = inbound.metrics();
+        let inbound = inbound.mk(
+            inbound_addr,
+            inbound_policies.clone(),
+            dst.profiles.clone(),
+            gateway.into_inner(),
+        );
+
+        let (outbound_addr, outbound_listen) = bind_out
+            .bind(&outbound.config().proxy.server)
+            .expect("Failed to bind outbound listener");
+        let outbound_metrics = outbound.metrics();
+        let outbound = outbound.mk(dst.profiles.clone(), outbound_policies, dst.resolve.clone());
+
+        // Build a task that initializes and runs the proxy stacks.
+        let start_proxy = {
+            let drain_rx = drain_rx.clone();
+            let identity_ready = identity.ready();
+
+            Box::pin(async move {
+                Self::await_identity(identity_ready).await;
+
+                tokio::spawn(
+                    serve::serve(outbound_listen, outbound, drain_rx.clone().signaled())
+                        .instrument(info_span!("outbound").or_current()),
+                );
+
+                tokio::spawn(
+                    serve::serve(inbound_listen, inbound, drain_rx.signaled())
+                        .instrument(info_span!("inbound").or_current()),
+                );
+            })
         };
+
+        metrics::process::register(registry.sub_registry_with_prefix("process"));
+        registry.register("proxy_build_info", "Proxy build info", BUILD_INFO.metric());
 
         let admin = {
             let identity = identity.receiver().server();
-            let metrics = inbound.metrics();
-            let policy = inbound_policies.clone();
-            let report = inbound
-                .metrics()
-                .and_report(outbound.metrics())
-                .and_report(report);
+            let metrics = inbound_metrics.clone();
+            let report = inbound_metrics
+                .and_report(outbound_metrics)
+                .and_report(report)
+                // The prom registry reports an "# EOF" at the end of its export, so
+                // it should be emitted last.
+                .and_report(prom::Report::from(registry));
             info_span!("admin").in_scope(move || {
                 admin.build(
                     bind_admin,
-                    policy,
+                    inbound_policies,
                     identity,
                     report,
                     metrics,
@@ -183,55 +300,6 @@ impl Config {
                     shutdown_tx,
                 )
             })?
-        };
-
-        let dst_addr = dst.addr.clone();
-        let gateway_stack = gateway::stack(
-            gateway,
-            inbound.clone(),
-            outbound.to_tcp_connect(),
-            dst.profiles.clone(),
-            dst.resolve.clone(),
-        );
-
-        // Bind the proxy sockets eagerly (so they're reserved and known) but defer building the
-        // stacks until the proxy starts running.
-        let (inbound_addr, inbound_listen) = bind_in
-            .bind(&inbound.config().proxy.server)
-            .expect("Failed to bind inbound listener");
-
-        let (outbound_addr, outbound_listen) = bind_out
-            .bind(&outbound.config().proxy.server)
-            .expect("Failed to bind outbound listener");
-
-        // Build a task that initializes and runs the proxy stacks.
-        let start_proxy = {
-            let identity_ready = identity.ready();
-            let inbound_addr = inbound_addr;
-            let profiles = dst.profiles;
-            let resolve = dst.resolve;
-
-            Box::pin(async move {
-                Self::await_identity(identity_ready).await;
-
-                tokio::spawn(
-                    outbound
-                        .serve(outbound_listen, profiles.clone(), resolve)
-                        .instrument(info_span!("outbound").or_current()),
-                );
-
-                tokio::spawn(
-                    inbound
-                        .serve(
-                            inbound_addr,
-                            inbound_listen,
-                            inbound_policies,
-                            profiles,
-                            gateway_stack,
-                        )
-                        .instrument(info_span!("inbound").or_current()),
-                );
-            })
         };
 
         Ok(App {
@@ -287,12 +355,12 @@ impl App {
         &self.dst
     }
 
-    pub fn local_identity(&self) -> identity::Name {
-        self.identity.receiver().name().clone()
+    pub fn local_server_name(&self) -> dns::Name {
+        self.identity.receiver().server_name().clone()
     }
 
-    pub fn identity_addr(&self) -> ControlAddr {
-        self.identity.addr()
+    pub fn local_tls_id(&self) -> identity::Id {
+        self.identity.receiver().local_id().clone()
     }
 
     pub fn opencensus_addr(&self) -> Option<&ControlAddr> {
@@ -340,7 +408,7 @@ impl App {
 
                         // Kick off the identity so that the process can become ready.
                         let local = identity.receiver();
-                        let local_id = local.name().clone();
+                        let local_id = local.local_id().clone();
                         let ready = identity.ready();
                         tokio::spawn(
                             identity

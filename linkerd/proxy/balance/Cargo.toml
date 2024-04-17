@@ -1,0 +1,25 @@
+[package]
+name = "linkerd-proxy-balance"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+futures = { version = "0.3", default-features = false }
+rand = "0.8"
+tokio = { version = "1", features = ["time"] }
+tracing = "0.1"
+
+linkerd-error = { path = "../../error" }
+linkerd-metrics = { path = "../../metrics" }
+linkerd-pool-p2c = { path = "../../pool/p2c" }
+linkerd-proxy-core = { path = "../core" }
+linkerd-proxy-balance-gauge-endpoints = { path = "gauge-endpoints" }
+linkerd-proxy-balance-queue = { path = "queue" }
+linkerd-stack = { path = "../../stack" }
+
+[dependencies.tower]
+version = "0.4.13"
+default-features = false
+features = ["load"]

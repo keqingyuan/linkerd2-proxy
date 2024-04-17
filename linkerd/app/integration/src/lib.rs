@@ -1,36 +1,40 @@
 //! Shared infrastructure for integration tests
 
-#![deny(
-    warnings,
-    rust_2018_idioms,
-    clippy::disallowed_methods,
-    clippy::disallowed_types
-)]
+#![warn(rust_2018_idioms, clippy::disallowed_methods, clippy::disallowed_types)]
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 
 mod test_env;
+
+#[cfg(test)]
+macro_rules! version_tests {
+    ($version:expr => $($test:ident),+ $(,)?) => {
+        $(
+            #[tokio::test]
+            async fn $test() {
+                cross_version::$test($version).await
+            }
+        )+
+    };
+}
 
 #[cfg(test)]
 mod tests;
 
 pub use self::test_env::TestEnv;
 pub use bytes::{Buf, BufMut, Bytes};
-pub use futures::{future, FutureExt, TryFuture, TryFutureExt};
-
 pub use futures::stream::{Stream, StreamExt};
+pub use futures::{future, FutureExt, TryFuture, TryFutureExt};
 pub use http::{HeaderMap, Request, Response, StatusCode};
 pub use http_body::Body as HttpBody;
-pub use linkerd_app::{
-    self as app,
-    core::{drain, Addr},
-};
+pub use linkerd_app as app;
+pub use linkerd_app_core::{drain, Addr};
 pub use linkerd_app_test::*;
 pub use linkerd_tracing::test::*;
 use socket2::Socket;
 pub use std::collections::HashMap;
 use std::fmt;
 pub use std::future::Future;
-use std::io;
 pub use std::net::SocketAddr;
 use std::pin::Pin;
 pub use std::sync::Arc;
@@ -38,10 +42,9 @@ use std::task::{Context, Poll};
 pub use std::time::Duration;
 pub use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpListener;
-pub use tokio::sync::oneshot;
+pub use tokio::sync::{mpsc, oneshot};
 pub use tonic as grpc;
 pub use tower::Service;
-pub use tracing::*;
 
 /// Environment variable for overriding the test patience.
 pub const ENV_TEST_PATIENCE_MS: &str = "RUST_TEST_PATIENCE_MS";
@@ -94,7 +97,7 @@ macro_rules! assert_eventually {
                     } else if i == $retries {
                         panic!(
                             "assertion failed after {} (retried {} times): {}",
-                            crate::HumanDuration(Instant::now().saturating_duration_since(start_t)),
+                            $crate::HumanDuration(Instant::now().saturating_duration_since(start_t)),
                             i,
                             format_args!($($arg)+)
                         )
@@ -107,7 +110,7 @@ macro_rules! assert_eventually {
                 }
             }.instrument(tracing::trace_span!(
                 "assert_eventually",
-                patience  = %crate::HumanDuration(patience),
+                patience  = %$crate::HumanDuration(patience),
                 max_retries = $retries
             ))
             .await
@@ -139,7 +142,7 @@ macro_rules! assert_contains {
 #[macro_export]
 macro_rules! assert_eventually_contains {
     ($scrape:expr, $contains:expr) => {{
-        let mut res: Result<(), crate::metrics::MatchErr> = Ok(());
+        let mut res: Result<(), $crate::metrics::MatchErr> = Ok(());
         let res_ref = &mut res;
         assert_eventually!(
             {
@@ -156,6 +159,7 @@ pub mod client;
 pub mod controller;
 pub mod identity;
 pub mod metrics;
+pub mod policy;
 pub mod proxy;
 pub mod server;
 pub mod tap;

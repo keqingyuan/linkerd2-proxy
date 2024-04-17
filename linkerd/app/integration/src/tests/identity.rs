@@ -1,10 +1,7 @@
 use crate::*;
 use std::{
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::{Duration, SystemTime},
+    sync::atomic::{AtomicBool, Ordering},
+    time::SystemTime,
 };
 
 #[tokio::test]
@@ -337,7 +334,7 @@ mod require_id_header {
                 let _profile = ctrl.profile_tx_default(srv.addr, "disco.test.svc.cluster.local");
                 let dst = ctrl
                     .destination_tx(format!("disco.test.svc.cluster.local:{}", srv.addr.port()));
-                dst.send(controller::destination_add_tls(srv.addr, app_name));
+                dst.send(controller::destination_add(srv.addr).identity(app_name));
 
                 // Make a proxy that has `proxy_identity` identity and no
                 // SO_ORIGINAL_DST backup
@@ -478,17 +475,16 @@ async fn identity_header_stripping() {
 
     let srv = server::http1()
         .route("/ready", "Ready")
-        .route_fn("/check-identity", |req| -> Response<Bytes> {
-            return match req.headers().get("l5d-client-id") {
-                Some(_) => Response::builder()
-                    .status(http::StatusCode::BAD_REQUEST)
-                    .body(Bytes::new())
-                    .unwrap(),
-                None => Response::builder()
-                    .status(http::StatusCode::OK)
-                    .body(Bytes::new())
-                    .unwrap(),
-            };
+        .route_fn("/check-identity", |req| {
+            let status = req
+                .headers()
+                .get("l5d-client-id")
+                .map(|_| http::StatusCode::BAD_REQUEST)
+                .unwrap_or(http::StatusCode::OK);
+            Response::builder()
+                .status(status)
+                .body(Default::default())
+                .unwrap()
         })
         .run()
         .await;

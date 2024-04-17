@@ -1,76 +1,50 @@
 use super::{BaseCreds, Certs, Creds, CredsTx};
+use boring::pkey::PKey;
 use boring::x509::{X509StoreContext, X509};
 use linkerd_error::Result;
 use linkerd_identity as id;
+use linkerd_meshtls_verifier as verifier;
 use std::sync::Arc;
 
 pub struct Store {
     creds: Arc<BaseCreds>,
-    csr: Vec<u8>,
-    name: id::Name,
+    id: id::Id,
     tx: CredsTx,
 }
 
 // === impl Store ===
 
 impl Store {
-    pub(super) fn new(creds: Arc<BaseCreds>, csr: &[u8], name: id::Name, tx: CredsTx) -> Self {
-        Self {
-            creds,
-            csr: csr.into(),
-            name,
-            tx,
-        }
-    }
-
-    fn cert_matches_name(&self, cert: &X509) -> bool {
-        for san in cert.subject_alt_names().into_iter().flatten() {
-            if let Some(n) = san.dnsname() {
-                if let Ok(name) = n.parse::<linkerd_dns_name::Name>() {
-                    if name == *self.name {
-                        return true;
-                    }
-                }
-            }
-        }
-
-        false
+    pub(super) fn new(creds: Arc<BaseCreds>, id: id::Id, tx: CredsTx) -> Self {
+        Self { creds, id, tx }
     }
 }
 
 impl id::Credentials for Store {
-    /// Returns the proxy's identity.
-    fn dns_name(&self) -> &id::Name {
-        &self.name
-    }
-
-    /// Returns the CSR that was configured at proxy startup.
-    fn gen_certificate_signing_request(&mut self) -> id::DerX509 {
-        id::DerX509(self.csr.to_vec())
-    }
-
     /// Publishes TLS client and server configurations using
     fn set_certificate(
         &mut self,
-        id::DerX509(leaf): id::DerX509,
+        id::DerX509(leaf_der): id::DerX509,
         intermediates: Vec<id::DerX509>,
+        key_pkcs8: Vec<u8>,
         _expiry: std::time::SystemTime,
     ) -> Result<()> {
-        let leaf = X509::from_der(&leaf)?;
-        if !self.cert_matches_name(&leaf) {
-            return Err("certificate does not have a DNS name SAN for the local identity".into());
-        }
+        let leaf = X509::from_der(&leaf_der)?;
+
+        verifier::verify_id(&leaf_der, &self.id)?;
 
         let intermediates = intermediates
             .into_iter()
             .map(|id::DerX509(der)| X509::from_der(&der).map_err(Into::into))
             .collect::<Result<Vec<_>>>()?;
 
+        let key = PKey::private_key_from_pkcs8(&key_pkcs8)?;
         let creds = Creds {
             base: self.creds.clone(),
             certs: Some(Certs {
                 leaf,
                 intermediates,
+                key,
             }),
         };
 

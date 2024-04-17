@@ -1,9 +1,4 @@
-#![deny(
-    warnings,
-    rust_2018_idioms,
-    clippy::disallowed_methods,
-    clippy::disallowed_types
-)]
+#![deny(rust_2018_idioms, clippy::disallowed_methods, clippy::disallowed_types)]
 #![forbid(unsafe_code)]
 
 mod server;
@@ -20,11 +15,12 @@ use prost::Message;
 use std::str::FromStr;
 use tracing::trace;
 
+#[allow(clippy::derive_partial_eq_without_eq)]
 mod proto {
-    include!(concat!(env!("OUT_DIR"), "/transport.l5d.io.rs"));
+    include!("gen/transport.l5d.io.rs");
 }
 
-#[derive(Clone, Debug, PartialEq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TransportHeader {
     /// The target port.
     pub port: u16,
@@ -70,7 +66,7 @@ impl TransportHeader {
     pub fn encode_prefaced(&self, buf: &mut BytesMut) -> Result<(), Error> {
         let header = self.to_proto();
         let header_len = header.encoded_len();
-        if header_len > std::u32::MAX as usize {
+        if header_len > u32::MAX as usize {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Message length exceeds capacity",
@@ -176,7 +172,7 @@ impl TransportHeader {
             Some(n)
         };
 
-        if h.port <= 0 || h.port > std::u16::MAX as i32 {
+        if h.port <= 0 || h.port > u16::MAX as i32 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Invalid port value",

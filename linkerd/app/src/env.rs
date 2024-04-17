@@ -1,4 +1,5 @@
-use crate::core::{
+use crate::{dns, gateway, identity, inbound, oc_collector, outbound, policy, spire};
+use linkerd_app_core::{
     addr,
     config::*,
     control::{Config as ControlConfig, ControlAddr},
@@ -7,8 +8,8 @@ use crate::core::{
     transport::{Keepalive, ListenAddr},
     Addr, AddrMatch, Conditional, IpNet,
 };
-use crate::{dns, gateway, identity, inbound, oc_collector, outbound};
-use inbound::policy;
+use linkerd_tonic_stream::ReceiveLimits;
+use rangemap::RangeInclusiveSet;
 use std::{
     collections::{HashMap, HashSet},
     fs,
@@ -38,6 +39,8 @@ pub enum EnvError {
     InvalidEnvVar,
     #[error("no destination service configured")]
     NoDestinationAddress,
+    #[error("no policy service configured")]
+    NoPolicyAddress,
 }
 
 #[derive(Debug, Error, Eq, PartialEq)]
@@ -74,6 +77,8 @@ pub enum ParseError {
         #[source]
         std::net::AddrParseError,
     ),
+    #[error("not a valid port range")]
+    NotAPortRange,
     #[error(transparent)]
     AddrError(addr::Error),
     #[error("not a valid identity name")]
@@ -96,8 +101,13 @@ pub const ENV_METRICS_RETAIN_IDLE: &str = "LINKERD2_PROXY_METRICS_RETAIN_IDLE";
 
 const ENV_INGRESS_MODE: &str = "LINKERD2_PROXY_INGRESS_MODE";
 
-const ENV_INBOUND_DISPATCH_TIMEOUT: &str = "LINKERD2_PROXY_INBOUND_DISPATCH_TIMEOUT";
-const ENV_OUTBOUND_DISPATCH_TIMEOUT: &str = "LINKERD2_PROXY_OUTBOUND_DISPATCH_TIMEOUT";
+const ENV_INBOUND_HTTP_QUEUE_CAPACITY: &str = "LINKERD2_PROXY_INBOUND_HTTP_QUEUE_CAPACITY";
+const ENV_INBOUND_HTTP_FAILFAST_TIMEOUT: &str = "LINKERD2_PROXY_INBOUND_HTTP_FAILFAST_TIMEOUT";
+
+const ENV_OUTBOUND_TCP_QUEUE_CAPACITY: &str = "LINKERD2_PROXY_OUTBOUND_TCP_QUEUE_CAPACITY";
+const ENV_OUTBOUND_TCP_FAILFAST_TIMEOUT: &str = "LINKERD2_PROXY_OUTBOUND_TCP_FAILFAST_TIMEOUT";
+const ENV_OUTBOUND_HTTP_QUEUE_CAPACITY: &str = "LINKERD2_PROXY_OUTBOUND_HTTP_QUEUE_CAPACITY";
+const ENV_OUTBOUND_HTTP_FAILFAST_TIMEOUT: &str = "LINKERD2_PROXY_OUTBOUND_HTTP_FAILFAST_TIMEOUT";
 
 pub const ENV_INBOUND_DETECT_TIMEOUT: &str = "LINKERD2_PROXY_INBOUND_DETECT_TIMEOUT";
 const ENV_OUTBOUND_DETECT_TIMEOUT: &str = "LINKERD2_PROXY_OUTBOUND_DETECT_TIMEOUT";
@@ -110,11 +120,6 @@ const ENV_OUTBOUND_ACCEPT_KEEPALIVE: &str = "LINKERD2_PROXY_OUTBOUND_ACCEPT_KEEP
 
 const ENV_INBOUND_CONNECT_KEEPALIVE: &str = "LINKERD2_PROXY_INBOUND_CONNECT_KEEPALIVE";
 const ENV_OUTBOUND_CONNECT_KEEPALIVE: &str = "LINKERD2_PROXY_OUTBOUND_CONNECT_KEEPALIVE";
-
-pub const ENV_BUFFER_CAPACITY: &str = "LINKERD2_PROXY_BUFFER_CAPACITY";
-
-pub const ENV_INBOUND_ROUTER_MAX_IDLE_AGE: &str = "LINKERD2_PROXY_INBOUND_ROUTER_MAX_IDLE_AGE";
-pub const ENV_OUTBOUND_ROUTER_MAX_IDLE_AGE: &str = "LINKERD2_PROXY_OUTBOUND_ROUTER_MAX_IDLE_AGE";
 
 const ENV_INBOUND_MAX_IDLE_CONNS_PER_ENDPOINT: &str = "LINKERD2_PROXY_MAX_IDLE_CONNS_PER_ENDPOINT";
 const ENV_OUTBOUND_MAX_IDLE_CONNS_PER_ENDPOINT: &str =
@@ -182,10 +187,29 @@ pub const ENV_INBOUND_IPS: &str = "LINKERD2_PROXY_INBOUND_IPS";
 pub const ENV_IDENTITY_DISABLED: &str = "LINKERD2_PROXY_IDENTITY_DISABLED";
 pub const ENV_IDENTITY_DIR: &str = "LINKERD2_PROXY_IDENTITY_DIR";
 pub const ENV_IDENTITY_TRUST_ANCHORS: &str = "LINKERD2_PROXY_IDENTITY_TRUST_ANCHORS";
-pub const ENV_IDENTITY_IDENTITY_LOCAL_NAME: &str = "LINKERD2_PROXY_IDENTITY_LOCAL_NAME";
 pub const ENV_IDENTITY_TOKEN_FILE: &str = "LINKERD2_PROXY_IDENTITY_TOKEN_FILE";
 pub const ENV_IDENTITY_MIN_REFRESH: &str = "LINKERD2_PROXY_IDENTITY_MIN_REFRESH";
 pub const ENV_IDENTITY_MAX_REFRESH: &str = "LINKERD2_PROXY_IDENTITY_MAX_REFRESH";
+
+/// This config is here for backwards compatibility. If set, both the tls id and the server
+/// name will be set to the value specified in this config. The values needs to be a DNS
+/// name
+pub const ENV_IDENTITY_IDENTITY_LOCAL_NAME: &str = "LINKERD2_PROXY_IDENTITY_LOCAL_NAME";
+/// Configures the TLS Id of the proxy inbound server. The value is expected to match the
+/// DNS or URI SAN of the leaf certificate that will be provisioned to this proxy.
+pub const ENV_IDENTITY_IDENTITY_SERVER_ID: &str = "LINKERD2_PROXY_IDENTITY_SERVER_ID";
+/// Configures the server name of this proxy. This value is expected to match the value
+/// that clients include in the SNI extension of the ClientHello, whenever they try to
+/// establish a TLS connection that shall be terminated by this proxy
+pub const ENV_IDENTITY_IDENTITY_SERVER_NAME: &str = "LINKERD2_PROXY_IDENTITY_SERVER_NAME";
+
+// If this config is set, then the proxy will be configured to use Spire as identity
+// provider
+pub const ENV_IDENTITY_SPIRE_SOCKET: &str = "LINKERD2_PROXY_IDENTITY_SPIRE_SOCKET";
+pub const IDENTITY_SPIRE_BASE: &str = "LINKERD2_PROXY_IDENTITY_SPIRE";
+const DEFAULT_SPIRE_BACKOFF: ExponentialBackoff =
+    ExponentialBackoff::new_unchecked(Duration::from_millis(100), Duration::from_secs(1), 0.1);
+const SPIFFE_ID_URI_SCHEME: &str = "spiffe";
 
 pub const ENV_IDENTITY_SVC_BASE: &str = "LINKERD2_PROXY_IDENTITY_SVC";
 
@@ -218,47 +242,83 @@ const ENV_INITIAL_STREAM_WINDOW_SIZE: &str = "LINKERD2_PROXY_HTTP2_INITIAL_STREA
 const ENV_INITIAL_CONNECTION_WINDOW_SIZE: &str =
     "LINKERD2_PROXY_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE";
 
+const ENV_INBOUND_HTTP1_CONNECTION_POOL_IDLE_TIMEOUT: &str =
+    "LINKERD2_PROXY_INBOUND_HTTP1_CONNECTION_POOL_IDLE_TIMEOUT";
+const ENV_OUTBOUND_HTTP1_CONNECTION_POOL_IDLE_TIMEOUT: &str =
+    "LINKERD2_PROXY_OUTBOUND_HTTP1_CONNECTION_POOL_IDLE_TIMEOUT";
+
+const ENV_SHUTDOWN_GRACE_PERIOD: &str = "LINKERD2_PROXY_SHUTDOWN_GRACE_PERIOD";
+
 // Default values for various configuration fields
 const DEFAULT_OUTBOUND_LISTEN_ADDR: &str = "127.0.0.1:4140";
 pub const DEFAULT_INBOUND_LISTEN_ADDR: &str = "0.0.0.0:4143";
 pub const DEFAULT_CONTROL_LISTEN_ADDR: &str = "0.0.0.0:4190";
+
 const DEFAULT_ADMIN_LISTEN_ADDR: &str = "127.0.0.1:4191";
 const DEFAULT_METRICS_RETAIN_IDLE: Duration = Duration::from_secs(10 * 60);
-const DEFAULT_INBOUND_DISPATCH_TIMEOUT: Duration = Duration::from_secs(1);
+
+const DEFAULT_INBOUND_HTTP_QUEUE_CAPACITY: usize = 10_000;
+const DEFAULT_INBOUND_HTTP_FAILFAST_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_INBOUND_DETECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_INBOUND_CONNECT_TIMEOUT: Duration = Duration::from_millis(300);
 const DEFAULT_INBOUND_CONNECT_BACKOFF: ExponentialBackoff =
     ExponentialBackoff::new_unchecked(Duration::from_millis(100), Duration::from_millis(500), 0.1);
-const DEFAULT_OUTBOUND_DISPATCH_TIMEOUT: Duration = Duration::from_secs(3);
+
+const DEFAULT_OUTBOUND_TCP_QUEUE_CAPACITY: usize = 10_000;
+const DEFAULT_OUTBOUND_TCP_FAILFAST_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_OUTBOUND_HTTP_QUEUE_CAPACITY: usize = 10_000;
+const DEFAULT_OUTBOUND_HTTP_FAILFAST_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_OUTBOUND_DETECT_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_OUTBOUND_CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 const DEFAULT_OUTBOUND_CONNECT_BACKOFF: ExponentialBackoff =
     ExponentialBackoff::new_unchecked(Duration::from_millis(100), Duration::from_millis(500), 0.1);
+
+const DEFAULT_CONTROL_QUEUE_CAPACITY: usize = 100;
+const DEFAULT_CONTROL_FAILFAST_TIMEOUT: Duration = Duration::from_secs(10);
+
 const DEFAULT_RESOLV_CONF: &str = "/etc/resolv.conf";
 
 const DEFAULT_INITIAL_STREAM_WINDOW_SIZE: u32 = 65_535; // Protocol default
 const DEFAULT_INITIAL_CONNECTION_WINDOW_SIZE: u32 = 1048576; // 1MB ~ 16 streams at capacity
 
+// 2 minutes seems like a reasonable amount of time to wait for connections to close...
+const DEFAULT_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(2 * 60);
+
 // This configuration limits the amount of time Linkerd retains cached clients &
-// connections.
+// connections for a given destination ip:port, as referenced by the application
+// client.
 //
 // After this timeout expires, the proxy will need to re-resolve destination
 // metadata. The outbound default of 5s matches Kubernetes' default DNS TTL. On
 // the outbound side, especially, we want to use a limited idle timeout since
 // stale clients/connections can have a severe memory impact, especially when
-// the application communicates with many endpoints or at high concurrency.
+// the application communicates with many destinations.
+const ENV_OUTBOUND_DISCOVERY_IDLE_TIMEOUT: &str = "LINKERD2_PROXY_OUTBOUND_DISCOVERY_IDLE_TIMEOUT";
+const DEFAULT_OUTBOUND_DISCOVERY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+// On the inbound side, we may lookup per-port policy or per-service profile
+// configuration. We are more permissive in retaining inbound configuration,
+// because we expect this to be a generally lower-cardinality set of
+// configurations to discover.
+const ENV_INBOUND_DISCOVERY_IDLE_TIMEOUT: &str = "LINKERD2_PROXY_INBOUND_DISCOVERY_IDLE_TIMEOUT";
+const DEFAULT_INBOUND_DISCOVERY_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
+// XXX This default inbound connection idle timeout should be less than or equal
+// to the server's idle timeout so that we don't try to reuse a connection as it
+// is being timed out of the server.
 //
-// On the inbound side, we want to be a bit more permissive so that periodic, as
-// the number of endpoints should generally be pretty constrained.
-const DEFAULT_INBOUND_ROUTER_MAX_IDLE_AGE: Duration = Duration::from_secs(20);
-const DEFAULT_OUTBOUND_ROUTER_MAX_IDLE_AGE: Duration = Duration::from_secs(5);
+// TODO(ver) this should be made configurable per-server from the proxy API.
+const DEFAULT_INBOUND_HTTP1_CONNECTION_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
+
+// TODO(ver) This should be configurable at the load balancer level.
+const DEFAULT_OUTBOUND_HTTP1_CONNECTION_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(3);
 
 // By default, we don't limit the number of connections a connection pol may
 // use, as doing so can severely impact CPU utilization for applications with
 // many concurrent requests. It's generally preferable to use the MAX_IDLE_AGE
 // limitations to quickly drop idle connections.
-const DEFAULT_INBOUND_MAX_IDLE_CONNS_PER_ENDPOINT: usize = std::usize::MAX;
-const DEFAULT_OUTBOUND_MAX_IDLE_CONNS_PER_ENDPOINT: usize = std::usize::MAX;
+const DEFAULT_INBOUND_MAX_IDLE_CONNS_PER_ENDPOINT: usize = usize::MAX;
+const DEFAULT_OUTBOUND_MAX_IDLE_CONNS_PER_ENDPOINT: usize = usize::MAX;
 
 // These settings limit the number of requests that have not received responses,
 // including those buffered in the proxy and dispatched to the destination
@@ -266,18 +326,8 @@ const DEFAULT_OUTBOUND_MAX_IDLE_CONNS_PER_ENDPOINT: usize = std::usize::MAX;
 const DEFAULT_INBOUND_MAX_IN_FLIGHT: usize = 100_000;
 const DEFAULT_OUTBOUND_MAX_IN_FLIGHT: usize = 100_000;
 
-// This value should be large enough to admit requests without exerting
-// backpressure so that requests implicitly buffer in the executor; but it
-// should be small enough that callers can't force the proxy to consume an
-// extreme amount of memory. Also keep in mind that there may be several buffers
-// used in a given proxy, each of which assumes this capacity.
-//
-// The value of 10K is chosen somewhat arbitrarily, but seems high enough to
-// buffer requests for high-load services.
-const DEFAULT_BUFFER_CAPACITY: usize = 10_000;
-
 const DEFAULT_DESTINATION_PROFILE_SUFFIXES: &str = "svc.cluster.local.";
-const DEFAULT_DESTINATION_PROFILE_IDLE_TIMEOUT: Duration = Duration::from_millis(500);
+const DEFAULT_DESTINATION_PROFILE_SKIP_TIMEOUT: Duration = Duration::from_millis(500);
 
 const DEFAULT_IDENTITY_MIN_REFRESH: Duration = Duration::from_secs(10);
 const DEFAULT_IDENTITY_MAX_REFRESH: Duration = Duration::from_secs(60 * 60 * 24);
@@ -294,11 +344,19 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
     let admin_listener_addr = parse(strings, ENV_ADMIN_LISTEN_ADDR, parse_socket_addr);
 
     let inbound_detect_timeout = parse(strings, ENV_INBOUND_DETECT_TIMEOUT, parse_duration);
-    let inbound_dispatch_timeout = parse(strings, ENV_INBOUND_DISPATCH_TIMEOUT, parse_duration);
     let inbound_connect_timeout = parse(strings, ENV_INBOUND_CONNECT_TIMEOUT, parse_duration);
+    let inbound_http_queue_capacity = parse(strings, ENV_INBOUND_HTTP_QUEUE_CAPACITY, parse_number);
+    let inbound_http_failfast_timeout =
+        parse(strings, ENV_INBOUND_HTTP_FAILFAST_TIMEOUT, parse_duration);
 
     let outbound_detect_timeout = parse(strings, ENV_OUTBOUND_DETECT_TIMEOUT, parse_duration);
-    let outbound_dispatch_timeout = parse(strings, ENV_OUTBOUND_DISPATCH_TIMEOUT, parse_duration);
+    let outbound_tcp_queue_capacity = parse(strings, ENV_OUTBOUND_TCP_QUEUE_CAPACITY, parse_number);
+    let outbound_tcp_failfast_timeout =
+        parse(strings, ENV_OUTBOUND_TCP_FAILFAST_TIMEOUT, parse_duration);
+    let outbound_http_queue_capacity =
+        parse(strings, ENV_OUTBOUND_HTTP_QUEUE_CAPACITY, parse_number);
+    let outbound_http_failfast_timeout =
+        parse(strings, ENV_OUTBOUND_HTTP_FAILFAST_TIMEOUT, parse_duration);
     let outbound_connect_timeout = parse(strings, ENV_OUTBOUND_CONNECT_TIMEOUT, parse_duration);
 
     let inbound_accept_keepalive = parse(strings, ENV_INBOUND_ACCEPT_KEEPALIVE, parse_duration);
@@ -307,18 +365,12 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
     let inbound_connect_keepalive = parse(strings, ENV_INBOUND_CONNECT_KEEPALIVE, parse_duration);
     let outbound_connect_keepalive = parse(strings, ENV_OUTBOUND_CONNECT_KEEPALIVE, parse_duration);
 
-    let inbound_disable_ports = parse(
-        strings,
-        ENV_INBOUND_PORTS_DISABLE_PROTOCOL_DETECTION,
-        parse_port_set,
-    );
+    let shutdown_grace_period = parse(strings, ENV_SHUTDOWN_GRACE_PERIOD, parse_duration);
 
-    let buffer_capacity = parse(strings, ENV_BUFFER_CAPACITY, parse_number);
-
-    let inbound_cache_max_idle_age =
-        parse(strings, ENV_INBOUND_ROUTER_MAX_IDLE_AGE, parse_duration);
-    let outbound_cache_max_idle_age =
-        parse(strings, ENV_OUTBOUND_ROUTER_MAX_IDLE_AGE, parse_duration);
+    let inbound_discovery_idle_timeout =
+        parse(strings, ENV_INBOUND_DISCOVERY_IDLE_TIMEOUT, parse_duration);
+    let outbound_discovery_idle_timeout =
+        parse(strings, ENV_OUTBOUND_DISCOVERY_IDLE_TIMEOUT, parse_duration);
 
     let inbound_max_idle_per_endpoint = parse(
         strings,
@@ -336,6 +388,8 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
 
     let metrics_retain_idle = parse(strings, ENV_METRICS_RETAIN_IDLE, parse_duration);
 
+    let control_receive_limits = mk_control_receive_limits(strings)?;
+
     // DNS
 
     let resolv_conf_path = strings.get(ENV_RESOLV_CONF);
@@ -343,7 +397,7 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
     let dns_min_ttl = parse(strings, ENV_DNS_MIN_TTL, parse_duration);
     let dns_max_ttl = parse(strings, ENV_DNS_MAX_TTL, parse_duration);
 
-    let identity_config = parse_identity_config(strings);
+    let tls = parse_tls_params(strings);
 
     let hostname = strings.get(ENV_HOSTNAME);
 
@@ -355,7 +409,7 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
 
     let dst_addr = parse_control_addr(strings, ENV_DESTINATION_SVC_BASE);
     let dst_token = strings.get(ENV_DESTINATION_CONTEXT);
-    let dst_profile_idle_timeout = parse(
+    let dst_profile_skip_timeout = parse(
         strings,
         ENV_DESTINATION_PROFILE_INITIAL_TIMEOUT,
         parse_duration,
@@ -383,8 +437,6 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
         ..Default::default()
     };
 
-    let buffer_capacity = buffer_capacity?.unwrap_or(DEFAULT_BUFFER_CAPACITY);
-
     let dst_profile_suffixes = dst_profile_suffixes?
         .unwrap_or_else(|| parse_dns_suffixes(DEFAULT_DESTINATION_PROFILE_SUFFIXES).unwrap());
     let dst_profile_networks = dst_profile_networks?.unwrap_or_default();
@@ -392,12 +444,9 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
     let inbound_ips = {
         let ips = parse(strings, ENV_INBOUND_IPS, parse_ip_set)?.unwrap_or_default();
         if ips.is_empty() {
-            info!(
-                "`{}` allowlist not configured, allowing all target addresses",
-                ENV_INBOUND_IPS
-            );
+            info!("`{ENV_INBOUND_IPS}` allowlist not configured, allowing all target addresses",);
         } else {
-            debug!(allowed = ?ips, "Only allowing connections targeting `{}`", ENV_INBOUND_IPS);
+            debug!(allowed = ?ips, "Only allowing connections targeting `{ENV_INBOUND_IPS}`");
         }
         std::sync::Arc::new(ips)
     };
@@ -424,11 +473,17 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
             keepalive,
             h2_settings,
         };
-        let cache_max_idle_age =
-            outbound_cache_max_idle_age?.unwrap_or(DEFAULT_OUTBOUND_ROUTER_MAX_IDLE_AGE);
+        let discovery_idle_timeout =
+            outbound_discovery_idle_timeout?.unwrap_or(DEFAULT_OUTBOUND_DISCOVERY_IDLE_TIMEOUT);
         let max_idle =
             outbound_max_idle_per_endpoint?.unwrap_or(DEFAULT_OUTBOUND_MAX_IDLE_CONNS_PER_ENDPOINT);
         let keepalive = Keepalive(outbound_connect_keepalive?);
+        let connection_pool_timeout = parse(
+            strings,
+            ENV_OUTBOUND_HTTP1_CONNECTION_POOL_IDLE_TIMEOUT,
+            parse_duration,
+        )?;
+
         let connect = ConnectConfig {
             keepalive,
             timeout: outbound_connect_timeout?.unwrap_or(DEFAULT_OUTBOUND_CONNECT_TIMEOUT),
@@ -440,14 +495,22 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
             h2_settings,
             h1_settings: h1::PoolSettings {
                 max_idle,
-                idle_timeout: cache_max_idle_age,
+                idle_timeout: connection_pool_timeout
+                    .unwrap_or(DEFAULT_OUTBOUND_HTTP1_CONNECTION_POOL_IDLE_TIMEOUT),
             },
         };
 
         let detect_protocol_timeout =
             outbound_detect_timeout?.unwrap_or(DEFAULT_OUTBOUND_DETECT_TIMEOUT);
-        let dispatch_timeout =
-            outbound_dispatch_timeout?.unwrap_or(DEFAULT_OUTBOUND_DISPATCH_TIMEOUT);
+
+        let tcp_queue_capacity =
+            outbound_tcp_queue_capacity?.unwrap_or(DEFAULT_OUTBOUND_TCP_QUEUE_CAPACITY);
+        let tcp_failfast_timeout =
+            outbound_tcp_failfast_timeout?.unwrap_or(DEFAULT_OUTBOUND_TCP_FAILFAST_TIMEOUT);
+        let http_queue_capacity =
+            outbound_http_queue_capacity?.unwrap_or(DEFAULT_OUTBOUND_HTTP_QUEUE_CAPACITY);
+        let http_failfast_timeout =
+            outbound_http_failfast_timeout?.unwrap_or(DEFAULT_OUTBOUND_HTTP_FAILFAST_TIMEOUT);
 
         outbound::Config {
             ingress_mode,
@@ -456,14 +519,20 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
             proxy: ProxyConfig {
                 server,
                 connect,
-                cache_max_idle_age,
-                buffer_capacity,
-                dispatch_timeout,
                 max_in_flight_requests: outbound_max_in_flight?
                     .unwrap_or(DEFAULT_OUTBOUND_MAX_IN_FLIGHT),
                 detect_protocol_timeout,
             },
             inbound_ips: inbound_ips.clone(),
+            discovery_idle_timeout,
+            tcp_connection_queue: QueueConfig {
+                capacity: tcp_queue_capacity,
+                failfast_timeout: tcp_failfast_timeout,
+            },
+            http_request_queue: QueueConfig {
+                capacity: http_queue_capacity,
+                failfast_timeout: http_failfast_timeout,
+            },
         }
     };
 
@@ -485,10 +554,16 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
             keepalive,
             h2_settings,
         };
-        let cache_max_idle_age =
-            inbound_cache_max_idle_age?.unwrap_or(DEFAULT_INBOUND_ROUTER_MAX_IDLE_AGE);
+        let discovery_idle_timeout =
+            inbound_discovery_idle_timeout?.unwrap_or(DEFAULT_INBOUND_DISCOVERY_IDLE_TIMEOUT);
         let max_idle =
             inbound_max_idle_per_endpoint?.unwrap_or(DEFAULT_INBOUND_MAX_IDLE_CONNS_PER_ENDPOINT);
+        let connection_pool_timeout = parse(
+            strings,
+            ENV_INBOUND_HTTP1_CONNECTION_POOL_IDLE_TIMEOUT,
+            parse_duration,
+        )?
+        .unwrap_or(DEFAULT_INBOUND_HTTP1_CONNECTION_POOL_IDLE_TIMEOUT);
         let keepalive = Keepalive(inbound_connect_keepalive?);
         let connect = ConnectConfig {
             keepalive,
@@ -501,25 +576,22 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
             h2_settings,
             h1_settings: h1::PoolSettings {
                 max_idle,
-                idle_timeout: cache_max_idle_age,
+                idle_timeout: connection_pool_timeout,
             },
         };
 
         let detect_protocol_timeout =
             inbound_detect_timeout?.unwrap_or(DEFAULT_INBOUND_DETECT_TIMEOUT);
-        let dispatch_timeout =
-            inbound_dispatch_timeout?.unwrap_or(DEFAULT_INBOUND_DISPATCH_TIMEOUT);
 
         // Ensure that connections that directly target the inbound port are secured (unless
         // identity is disabled).
         let policy = {
-            let inbound_port = server.addr.as_ref().port();
+            let inbound_port = server.addr.port();
 
             let cluster_nets = parse(strings, ENV_POLICY_CLUSTER_NETWORKS, parse_networks)?
                 .unwrap_or_else(|| {
                     info!(
-                        "{} not set; cluster-scoped modes are unsupported",
-                        ENV_POLICY_CLUSTER_NETWORKS
+                        "{ENV_POLICY_CLUSTER_NETWORKS} not set; cluster-scoped modes are unsupported",
                     );
                     Default::default()
                 });
@@ -534,143 +606,45 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
                     "{} was not set; using `all-unauthenticated`",
                     ENV_INBOUND_DEFAULT_POLICY
                 );
-                policy::defaults::all_unauthenticated(detect_protocol_timeout).into()
+                inbound::policy::defaults::all_unauthenticated(detect_protocol_timeout).into()
             });
 
-            match parse_control_addr(strings, ENV_POLICY_SVC_BASE)? {
-                Some(addr) => {
-                    // If the inbound is proxy is configured to discover policies, then load the set
-                    // of all known inbound ports to be discovered during initialization.
-                    let mut ports = match parse(strings, ENV_INBOUND_PORTS, parse_port_set)? {
-                        Some(ports) => ports,
-                        None => {
-                            error!("No inbound ports specified via {}", ENV_INBOUND_PORTS,);
-                            Default::default()
-                        }
-                    };
-                    if !gateway.allow_discovery.is_empty() {
-                        // Add the inbound port to the set of ports to be discovered if the proxy is
-                        // configured as a gateway. If there are no suffixes configured in the
-                        // gateway, it's not worth maintaining the extra policy watch (which will be
-                        // the more common case).
-                        ports.insert(inbound_port);
-                    }
-
-                    // Ensure that the admin server port is included in policy discovery.
-                    ports.insert(admin_listener_addr.port());
-
-                    // The workload, which is opaque from the proxy's point-of-view, is sent to the
-                    // policy controller to support policy discovery.
-                    let workload = strings.get(ENV_POLICY_WORKLOAD)?.ok_or_else(|| {
-                        error!(
-                            "{} must be set with {}_ADDR",
-                            ENV_POLICY_WORKLOAD, ENV_POLICY_SVC_BASE
-                        );
-                        EnvError::InvalidEnvVar
-                    })?;
-
-                    let control = {
-                        let connect = if addr.addr.is_loopback() {
-                            connect.clone()
-                        } else {
-                            outbound.proxy.connect.clone()
-                        };
-                        ControlConfig {
-                            addr,
-                            connect,
-                            buffer_capacity,
-                        }
-                    };
-
-                    inbound::policy::Config::Discover {
-                        default,
-                        ports,
-                        workload,
-                        control,
-                    }
-                }
-
+            // Load the the set of all known inbound ports to be discovered
+            // eagerly during initialization.
+            let mut ports = match parse(strings, ENV_INBOUND_PORTS, parse_port_range_set)? {
+                Some(ports) => ports.into_iter().flatten().collect::<HashSet<_>>(),
                 None => {
-                    let default_allow = match default.clone() {
-                        policy::DefaultPolicy::Allow(a) => a,
-                        policy::DefaultPolicy::Deny => {
-                            warn!("The default policy `deny` may not be used with a static policy configuration");
-                            return Err(EnvError::InvalidEnvVar);
-                        }
-                    };
-
-                    // If the inbound is not configured to discover policies, then load basic policies from the environment:
-                    // - ports that require authentication
-                    // - ports that require some form of proxy-terminated TLS, though not
-                    //   necessarily with a client identity.
-                    // - opaque ports
-                    let require_identity_ports =
-                        parse(strings, ENV_INBOUND_PORTS_REQUIRE_IDENTITY, parse_port_set)?
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|p| {
-                                let allow =
-                                    policy::defaults::all_authenticated(detect_protocol_timeout);
-                                (p, allow)
-                            })
-                            .collect::<HashMap<_, _>>();
-
-                    let require_tls_ports = {
-                        let mut ports =
-                            parse(strings, ENV_INBOUND_PORTS_REQUIRE_TLS, parse_port_set)?
-                                .unwrap_or_default()
-                                .into_iter()
-                                .map(|p| {
-                                    let allow = policy::defaults::all_mtls_unauthenticated(
-                                        detect_protocol_timeout,
-                                    );
-                                    (p, allow)
-                                })
-                                .collect::<HashMap<_, _>>();
-                        // `require_identity` is more restrictive than `require_tls`, so prefer it if
-                        // there are duplicates.
-                        for p in require_identity_ports.keys() {
-                            ports.remove(p);
-                        }
-                        ports
-                    };
-
-                    let opaque_ports = {
-                        let ports = inbound_disable_ports?
-                            .unwrap_or_default()
-                            .into_iter()
-                            .map(|p| {
-                                let mut sp = require_identity_ports
-                                    .get(&p)
-                                    .or_else(|| require_tls_ports.get(&p))
-                                    .cloned()
-                                    .unwrap_or_else(|| default_allow.clone());
-                                sp.protocol = inbound::policy::Protocol::Opaque;
-                                (p, sp)
-                            })
-                            .collect::<HashMap<_, inbound::policy::ServerPolicy>>();
-                        // Ensure that the inbound port does not disable protocol detection, as
-                        if ports.contains_key(&inbound_port) {
-                            error!(
-                                "{} must not contain {} ({})",
-                                ENV_INBOUND_PORTS_DISABLE_PROTOCOL_DETECTION,
-                                ENV_INBOUND_LISTEN_ADDR,
-                                inbound_port
-                            );
-                            return Err(EnvError::InvalidEnvVar);
-                        }
-                        ports
-                    };
-
-                    inbound::policy::Config::Fixed {
-                        default,
-                        ports: require_identity_ports
-                            .into_iter()
-                            .chain(require_tls_ports)
-                            .chain(opaque_ports)
-                            .collect(),
-                    }
+                    debug!("No inbound ports specified via {ENV_INBOUND_PORTS}",);
+                    Default::default()
                 }
+            };
+            if !gateway.allow_discovery.is_empty() {
+                // Add the inbound port to the set of ports to be discovered if the proxy is
+                // configured as a gateway. If there are no suffixes configured in the
+                // gateway, it's not worth maintaining the extra policy watch (which will be
+                // the more common case).
+                ports.insert(inbound_port);
+            }
+
+            // Ensure that the admin server port is included in policy discovery.
+            ports.insert(admin_listener_addr.port());
+
+            // Determine any pre-configured opaque ports.
+            let opaque_ports = parse(
+                strings,
+                ENV_INBOUND_PORTS_DISABLE_PROTOCOL_DETECTION,
+                parse_port_range_set,
+            )?
+            // If the `INBOUND_PORTS_DISABLE_PROTOCOL_DETECTION` environment
+            // variable is not set, then there are no default opaque ports,
+            // and that's fine.
+            .unwrap_or_default();
+
+            inbound::policy::Config::Discover {
+                default,
+                ports,
+                cache_max_idle_age: discovery_idle_timeout,
+                opaque_ports,
             }
         };
 
@@ -679,17 +653,22 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
             proxy: ProxyConfig {
                 server,
                 connect,
-                cache_max_idle_age,
-                buffer_capacity,
-                dispatch_timeout,
                 max_in_flight_requests: inbound_max_in_flight?
                     .unwrap_or(DEFAULT_INBOUND_MAX_IN_FLIGHT),
                 detect_protocol_timeout,
             },
             policy,
-            profile_idle_timeout: dst_profile_idle_timeout?
-                .unwrap_or(DEFAULT_DESTINATION_PROFILE_IDLE_TIMEOUT),
+            profile_skip_timeout: dst_profile_skip_timeout?
+                .unwrap_or(DEFAULT_DESTINATION_PROFILE_SKIP_TIMEOUT),
             allowed_ips: inbound_ips.into(),
+
+            discovery_idle_timeout,
+            http_request_queue: QueueConfig {
+                capacity: inbound_http_queue_capacity?
+                    .unwrap_or(DEFAULT_INBOUND_HTTP_QUEUE_CAPACITY),
+                failfast_timeout: inbound_http_failfast_timeout?
+                    .unwrap_or(DEFAULT_INBOUND_HTTP_FAILFAST_TIMEOUT),
+            },
         }
     };
 
@@ -700,13 +679,66 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
         } else {
             outbound.proxy.connect.clone()
         };
+        let failfast_timeout = if addr.addr.is_loopback() {
+            inbound.http_request_queue.failfast_timeout
+        } else {
+            outbound.http_request_queue.failfast_timeout
+        };
+        let limits = addr
+            .addr
+            .is_loopback()
+            .then(ReceiveLimits::default)
+            .unwrap_or(control_receive_limits);
         super::dst::Config {
             context: dst_token?.unwrap_or_default(),
             control: ControlConfig {
                 addr,
                 connect,
-                buffer_capacity,
+                buffer: QueueConfig {
+                    capacity: DEFAULT_CONTROL_QUEUE_CAPACITY,
+                    failfast_timeout,
+                },
             },
+            limits,
+        }
+    };
+
+    let policy = {
+        let addr =
+            parse_control_addr(strings, ENV_POLICY_SVC_BASE)?.ok_or(EnvError::NoPolicyAddress)?;
+        // The workload, which is opaque from the proxy's point-of-view, is sent to the
+        // policy controller to support policy discovery.
+        let workload = strings.get(ENV_POLICY_WORKLOAD)?.ok_or_else(|| {
+            error!("{ENV_POLICY_WORKLOAD} must be set with {ENV_POLICY_SVC_BASE}_ADDR",);
+            EnvError::InvalidEnvVar
+        })?;
+
+        let limits = addr
+            .addr
+            .is_loopback()
+            .then(ReceiveLimits::default)
+            .unwrap_or(control_receive_limits);
+
+        let control = {
+            let connect = if addr.addr.is_loopback() {
+                inbound.proxy.connect.clone()
+            } else {
+                outbound.proxy.connect.clone()
+            };
+            ControlConfig {
+                addr,
+                connect,
+                buffer: QueueConfig {
+                    capacity: DEFAULT_CONTROL_QUEUE_CAPACITY,
+                    failfast_timeout: DEFAULT_CONTROL_FAILFAST_TIMEOUT,
+                },
+            }
+        };
+
+        policy::Config {
+            control,
+            workload,
+            limits,
         }
     };
 
@@ -717,6 +749,12 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
             keepalive: inbound.proxy.server.keepalive,
             h2_settings,
         },
+
+        // TODO(ver) Currently we always enable profiling when the pprof feature
+        // is enabled. In the future, this should be driven by runtime
+        // configuration.
+        #[cfg(feature = "pprof")]
+        enable_profiling: true,
     };
 
     let dns = dns::Config {
@@ -735,7 +773,11 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
             } else {
                 outbound.proxy.connect.clone()
             };
-
+            let failfast_timeout = if addr.addr.is_loopback() {
+                inbound.http_request_queue.failfast_timeout
+            } else {
+                outbound.http_request_queue.failfast_timeout
+            };
             let attributes = oc_attributes_file_path
                 .map(|path| match path {
                     Some(path) => oc_trace_attributes(path),
@@ -749,7 +791,10 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
                 control: ControlConfig {
                     addr,
                     connect,
-                    buffer_capacity: 10,
+                    buffer: QueueConfig {
+                        capacity: DEFAULT_CONTROL_QUEUE_CAPACITY,
+                        failfast_timeout,
+                    },
                 },
             }))
         }
@@ -767,21 +812,60 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
         .unwrap_or(super::tap::Config::Disabled);
 
     let identity = {
-        let (addr, certify, documents) = identity_config?;
-        // If the address doesn't have a server identity, then we're on localhost.
-        let connect = if addr.addr.is_loopback() {
-            inbound.proxy.connect.clone()
-        } else {
-            outbound.proxy.connect.clone()
-        };
-        identity::Config {
-            certify,
-            control: ControlConfig {
-                addr,
-                connect,
-                buffer_capacity: 1,
+        let tls = tls?;
+
+        match strings.get(ENV_IDENTITY_SPIRE_SOCKET)? {
+            Some(socket) => match &tls.id {
+                // TODO: perform stricter SPIFFE ID validation following:
+                // https://github.com/spiffe/spiffe/blob/27b59b81ba8c56885ac5d4be73b35b9b3305fd7a/standards/SPIFFE-ID.md
+                identity::Id::Uri(uri)
+                    if uri.scheme().eq_ignore_ascii_case(SPIFFE_ID_URI_SCHEME) =>
+                {
+                    identity::Config::Spire {
+                        tls,
+                        client: spire::Config {
+                            socket_addr: std::sync::Arc::new(socket),
+                            backoff: parse_backoff(
+                                strings,
+                                IDENTITY_SPIRE_BASE,
+                                DEFAULT_SPIRE_BACKOFF,
+                            )?,
+                        },
+                    }
+                }
+                _ => {
+                    error!("Spire support requires a SPIFFE TLS Id");
+                    return Err(EnvError::InvalidEnvVar);
+                }
             },
-            documents,
+            None => {
+                let (addr, certify) = parse_linkerd_identity_config(strings)?;
+
+                // If the address doesn't have a server identity, then we're on localhost.
+                let connect = if addr.addr.is_loopback() {
+                    inbound.proxy.connect.clone()
+                } else {
+                    outbound.proxy.connect.clone()
+                };
+                let failfast_timeout = if addr.addr.is_loopback() {
+                    inbound.http_request_queue.failfast_timeout
+                } else {
+                    outbound.http_request_queue.failfast_timeout
+                };
+
+                identity::Config::Linkerd {
+                    certify,
+                    tls,
+                    client: ControlConfig {
+                        addr,
+                        connect,
+                        buffer: QueueConfig {
+                            capacity: DEFAULT_CONTROL_QUEUE_CAPACITY,
+                            failfast_timeout,
+                        },
+                    },
+                }
+            }
         }
     };
 
@@ -791,10 +875,12 @@ pub fn parse_config<S: Strings>(strings: &S) -> Result<super::Config, EnvError> 
         dst,
         tap,
         oc_collector,
+        policy,
         identity,
         outbound,
         gateway,
         inbound,
+        shutdown_grace_period: shutdown_grace_period?.unwrap_or(DEFAULT_SHUTDOWN_GRACE_PERIOD),
     })
 }
 
@@ -825,7 +911,36 @@ fn convert_attributes_string_to_map(attributes: String) -> HashMap<String, Strin
         .collect()
 }
 
-// ===== impl Env =====
+fn mk_control_receive_limits(env: &dyn Strings) -> Result<ReceiveLimits, EnvError> {
+    const ENV_INIT: &str = "LINKERD2_PROXY_CONTROL_STREAM_INITIAL_TIMEOUT";
+    const ENV_IDLE: &str = "LINKERD2_PROXY_CONTROL_STREAM_IDLE_TIMEOUT";
+    const ENV_LIFE: &str = "LINKERD2_PROXY_CONTROL_STREAM_LIFETIME";
+
+    let initial = parse(env, ENV_INIT, parse_duration_opt)?.flatten();
+    let idle = parse(env, ENV_IDLE, parse_duration_opt)?.flatten();
+    let lifetime = parse(env, ENV_LIFE, parse_duration_opt)?.flatten();
+
+    if initial.unwrap_or(Duration::ZERO) > idle.unwrap_or(Duration::MAX) {
+        error!("{ENV_INIT} must be less than {ENV_IDLE}");
+        return Err(EnvError::InvalidEnvVar);
+    }
+    if initial.unwrap_or(Duration::ZERO) > lifetime.unwrap_or(Duration::MAX) {
+        error!("{ENV_INIT} must be less than {ENV_LIFE}");
+        return Err(EnvError::InvalidEnvVar);
+    }
+    if idle.unwrap_or(Duration::ZERO) > lifetime.unwrap_or(Duration::MAX) {
+        error!("{ENV_IDLE} must be less than {ENV_LIFE}");
+        return Err(EnvError::InvalidEnvVar);
+    }
+
+    Ok(ReceiveLimits {
+        initial,
+        idle,
+        lifetime,
+    })
+}
+
+// === impl Env ===
 
 impl Strings for Env {
     fn get(&self, key: &str) -> Result<Option<String>, EnvError> {
@@ -835,7 +950,7 @@ impl Strings for Env {
             Ok(value) => Ok(Some(value)),
             Err(env::VarError::NotPresent) => Ok(None),
             Err(env::VarError::NotUnicode(_)) => {
-                error!("{} is not encoded in Unicode", key);
+                error!("{key} is not encoded in Unicode");
                 Err(EnvError::InvalidEnvVar)
             }
         }
@@ -848,7 +963,7 @@ impl Env {
     }
 }
 
-// ===== Parsing =====
+// === Parsing ===
 
 /// There is a dependency on identity being enabled for tap to work. The
 /// status of tap is determined by the ENV_TAP_SVC_NAME env variable being set
@@ -885,6 +1000,13 @@ where
     s.parse().map_err(Into::into)
 }
 
+fn parse_duration_opt(s: &str) -> Result<Option<Duration>, ParseError> {
+    if s.is_empty() {
+        return Ok(None);
+    }
+    parse_duration(s).map(Some)
+}
+
 fn parse_duration(s: &str) -> Result<Duration, ParseError> {
     use regex::Regex;
 
@@ -908,7 +1030,7 @@ fn parse_socket_addr(s: &str) -> Result<SocketAddr, ParseError> {
     match parse_addr(s)? {
         Addr::Socket(a) => Ok(a),
         _ => {
-            error!("Expected IP:PORT; found: {}", s);
+            error!("Expected IP:PORT; found: {s}");
             Err(ParseError::HostIsNotAnIpAddress)
         }
     }
@@ -922,24 +1044,59 @@ fn parse_ip_set(s: &str) -> Result<HashSet<IpAddr>, ParseError> {
 
 fn parse_addr(s: &str) -> Result<Addr, ParseError> {
     Addr::from_str(s).map_err(|e| {
-        error!("Not a valid address: {}", s);
+        error!("Not a valid address: {s}");
         ParseError::AddrError(e)
     })
 }
 
-fn parse_port_set(s: &str) -> Result<HashSet<u16>, ParseError> {
-    let mut set = HashSet::new();
+fn parse_port_range_set(s: &str) -> Result<RangeInclusiveSet<u16>, ParseError> {
+    let mut set = RangeInclusiveSet::new();
     if !s.is_empty() {
-        for num in s.split(',') {
-            set.insert(parse_number::<u16>(num)?);
+        for part in s.split(',') {
+            let part = part.trim();
+            // Ignore empty list entries
+            if part.is_empty() {
+                continue;
+            }
+
+            let mut parts = part.splitn(2, '-');
+            let low = parts
+                .next()
+                .ok_or_else(|| {
+                    error!("Not a valid port range: {part}");
+                    ParseError::NotAPortRange
+                })?
+                .trim();
+            let low = parse_number::<u16>(low)?;
+            if let Some(high) = parts.next() {
+                let high = high.trim();
+                let high = parse_number::<u16>(high).map_err(|e| {
+                    error!("Not a valid port range: {part}");
+                    e
+                })?;
+                if high < low {
+                    error!("Not a valid port range: {part}; {high} is greater than {low}");
+                    return Err(ParseError::NotAPortRange);
+                }
+                set.insert(low..=high);
+            } else {
+                set.insert(low..=low);
+            }
         }
     }
     Ok(set)
 }
 
-pub(super) fn parse_identity(s: &str) -> Result<identity::Name, ParseError> {
-    identity::Name::from_str(s).map_err(|identity::InvalidName| {
-        error!("Not a valid identity name: {}", s);
+pub(super) fn parse_dns_name(s: &str) -> Result<dns::Name, ParseError> {
+    s.parse().map_err(|_| {
+        error!("Not a valid identity name: {s}");
+        ParseError::NameError
+    })
+}
+
+pub(super) fn parse_identity(s: &str) -> Result<identity::Id, ParseError> {
+    s.parse().map_err(|_| {
+        error!("Not a valid identity name: {s}");
         ParseError::NameError
     })
 }
@@ -955,7 +1112,7 @@ where
     match strings.get(name)? {
         Some(ref s) => {
             let r = parse(s).map_err(|parse_error| {
-                error!("{}={:?} is not valid: {:?}", name, s, parse_error);
+                error!("{name}={s:?} is not valid: {parse_error:?}");
                 EnvError::InvalidEnvVar
             })?;
             Ok(Some(r))
@@ -1027,20 +1184,28 @@ fn parse_default_policy(
     s: &str,
     cluster_nets: HashSet<IpNet>,
     detect_timeout: Duration,
-) -> Result<policy::DefaultPolicy, ParseError> {
+) -> Result<inbound::policy::DefaultPolicy, ParseError> {
     match s {
-        "deny" => Ok(policy::DefaultPolicy::Deny),
-        "all-authenticated" => Ok(policy::defaults::all_authenticated(detect_timeout).into()),
-        "all-unauthenticated" => Ok(policy::defaults::all_unauthenticated(detect_timeout).into()),
+        "deny" => Ok(inbound::policy::DefaultPolicy::Deny),
+        "all-authenticated" => {
+            Ok(inbound::policy::defaults::all_authenticated(detect_timeout).into())
+        }
+        "all-unauthenticated" => {
+            Ok(inbound::policy::defaults::all_unauthenticated(detect_timeout).into())
+        }
 
         // If cluster networks are configured, support cluster-scoped default policies.
         name if cluster_nets.is_empty() => Err(ParseError::InvalidPortPolicy(name.to_string())),
-        "cluster-authenticated" => {
-            Ok(policy::defaults::cluster_authenticated(cluster_nets, detect_timeout).into())
-        }
-        "cluster-unauthenticated" => {
-            Ok(policy::defaults::cluster_unauthenticated(cluster_nets, detect_timeout).into())
-        }
+        "cluster-authenticated" => Ok(inbound::policy::defaults::cluster_authenticated(
+            cluster_nets,
+            detect_timeout,
+        )
+        .into()),
+        "cluster-unauthenticated" => Ok(inbound::policy::defaults::cluster_unauthenticated(
+            cluster_nets,
+            detect_timeout,
+        )
+        .into()),
 
         name => Err(ParseError::InvalidPortPolicy(name.to_string())),
     }
@@ -1066,7 +1231,7 @@ pub fn parse_backoff<S: Strings>(
             })
         }
         _ => {
-            error!("You need to specify either all of {} {} {} or none of them to use the default backoff", min_env, max_env,jitter_env );
+            error!("You need to specify either all of {min_env} {max_env} {jitter_env} or none of them to use the default backoff");
             Err(EnvError::InvalidEnvVar)
         }
     }
@@ -1077,7 +1242,7 @@ pub fn parse_control_addr<S: Strings>(
     base: &str,
 ) -> Result<Option<ControlAddr>, EnvError> {
     let a = parse(strings, &format!("{}_ADDR", base), parse_addr)?;
-    let n = parse(strings, &format!("{}_NAME", base), parse_identity)?;
+    let n = parse(strings, &format!("{}_NAME", base), parse_dns_name)?;
     match (a, n) {
         (None, None) => Ok(None),
         (Some(ref addr), _) if addr.is_loopback() => Ok(Some(ControlAddr {
@@ -1086,121 +1251,118 @@ pub fn parse_control_addr<S: Strings>(
         })),
         (Some(addr), Some(name)) => Ok(Some(ControlAddr {
             addr,
-            identity: Conditional::Some(tls::ServerId(name).into()),
+            identity: Conditional::Some(tls::ClientTls::new(
+                tls::ServerId(name.clone().into()),
+                tls::ServerName(name),
+            )),
         })),
         _ => {
-            error!("{}_ADDR and {}_NAME must be specified together", base, base);
+            error!("{base}_ADDR and {base}_NAME must be specified together");
             Err(EnvError::InvalidEnvVar)
         }
     }
 }
 
-pub fn parse_identity_config<S: Strings>(
-    strings: &S,
-) -> Result<(ControlAddr, identity::certify::Config, identity::Documents), EnvError> {
-    let control = parse_control_addr(strings, ENV_IDENTITY_SVC_BASE);
+pub fn parse_tls_params<S: Strings>(strings: &S) -> Result<identity::TlsParams, EnvError> {
     let ta = parse(strings, ENV_IDENTITY_TRUST_ANCHORS, |s| {
         if s.is_empty() {
             return Err(ParseError::InvalidTrustAnchors);
         }
         Ok(s.to_string())
     });
-    let dir = parse(strings, ENV_IDENTITY_DIR, |ref s| Ok(PathBuf::from(s)));
-    let tok = parse(strings, ENV_IDENTITY_TOKEN_FILE, |ref s| {
-        identity::TokenSource::if_nonempty_file(s.to_string()).map_err(|e| {
-            error!("Could not read {}: {}", ENV_IDENTITY_TOKEN_FILE, e);
-            ParseError::InvalidTokenSource
-        })
-    });
-    let li = parse(strings, ENV_IDENTITY_IDENTITY_LOCAL_NAME, parse_identity);
-    let min_refresh = parse(strings, ENV_IDENTITY_MIN_REFRESH, parse_duration);
-    let max_refresh = parse(strings, ENV_IDENTITY_MAX_REFRESH, parse_duration);
+
+    // The assumtion here is that if `ENV_IDENTITY_IDENTITY_LOCAL_NAME` has been set
+    // we will use that for both tls id and server name.
+    let (server_id_env_var, server_name_env_var) =
+        if strings.get(ENV_IDENTITY_IDENTITY_LOCAL_NAME)?.is_some() {
+            (
+                ENV_IDENTITY_IDENTITY_LOCAL_NAME,
+                ENV_IDENTITY_IDENTITY_LOCAL_NAME,
+            )
+        } else {
+            (
+                ENV_IDENTITY_IDENTITY_SERVER_ID,
+                ENV_IDENTITY_IDENTITY_SERVER_NAME,
+            )
+        };
+
+    let server_id = parse(strings, server_id_env_var, parse_identity);
+    let server_name = parse(strings, server_name_env_var, parse_dns_name);
 
     if strings
         .get(ENV_IDENTITY_DISABLED)?
         .map(|d| !d.is_empty())
         .unwrap_or(false)
     {
-        error!(
-            "{} is no longer supported. Identity is must be enabled.",
-            ENV_IDENTITY_DISABLED
-        );
+        error!("{ENV_IDENTITY_DISABLED} is no longer supported. Identity is must be enabled.");
         return Err(EnvError::InvalidEnvVar);
     }
 
-    match (control?, ta?, dir?, li?, tok?, min_refresh?, max_refresh?) {
-        (
-            Some(control),
-            Some(trust_anchors_pem),
-            Some(dir),
-            Some(local_name),
-            Some(token),
-            min_refresh,
-            max_refresh,
-        ) => {
-            let key = {
-                let mut p = dir.clone();
-                p.push("key");
-                p.set_extension("p8");
-
-                fs::read(p)
-                    .map_err(|e| {
-                        error!("Failed to read key: {}", e);
-                        EnvError::InvalidEnvVar
-                    })
-                    .and_then(|b| {
-                        if b.is_empty() {
-                            error!("No CSR found");
-                            return Err(EnvError::InvalidEnvVar);
-                        }
-                        Ok(b)
-                    })
+    match (ta?, server_id?, server_name?) {
+        (Some(trust_anchors_pem), Some(server_id), Some(server_name)) => {
+            let params = identity::TlsParams {
+                id: server_id,
+                server_name,
+                trust_anchors_pem,
             };
+            Ok(params)
+        }
+        (trust_anchors_pem, server_id, server_name) => {
+            for (unset, name) in &[
+                (trust_anchors_pem.is_none(), ENV_IDENTITY_TRUST_ANCHORS),
+                (server_id.is_none(), server_id_env_var),
+                (server_name.is_none(), server_name_env_var),
+            ] {
+                if *unset {
+                    error!("{} must be set.", name);
+                }
+            }
+            Err(EnvError::InvalidEnvVar)
+        }
+    }
+}
 
-            let csr = {
-                let mut p = dir;
-                p.push("csr");
-                p.set_extension("der");
+pub fn parse_linkerd_identity_config<S: Strings>(
+    strings: &S,
+) -> Result<(ControlAddr, identity::client::linkerd::Config), EnvError> {
+    let control = parse_control_addr(strings, ENV_IDENTITY_SVC_BASE);
+    let dir = parse(strings, ENV_IDENTITY_DIR, |ref s| Ok(PathBuf::from(s)));
+    let tok = parse(strings, ENV_IDENTITY_TOKEN_FILE, |ref s| {
+        identity::client::linkerd::TokenSource::if_nonempty_file(s.to_string()).map_err(|e| {
+            error!("Could not read {ENV_IDENTITY_TOKEN_FILE}: {e}");
+            ParseError::InvalidTokenSource
+        })
+    });
 
-                fs::read(p)
-                    .map_err(|e| {
-                        error!("Failed to read Csr: {}", e);
-                        EnvError::InvalidEnvVar
-                    })
-                    .and_then(|b| {
-                        if b.is_empty() {
-                            error!("No CSR found");
-                            return Err(EnvError::InvalidEnvVar);
-                        }
-                        Ok(b)
-                    })
-            };
+    let min_refresh = parse(strings, ENV_IDENTITY_MIN_REFRESH, parse_duration);
+    let max_refresh = parse(strings, ENV_IDENTITY_MAX_REFRESH, parse_duration);
 
-            let certify = identity::certify::Config {
+    match (control?, dir?, tok?, min_refresh?, max_refresh?) {
+        (Some(control), Some(dir), Some(token), min_refresh, max_refresh) => {
+            let certify = identity::client::linkerd::Config {
                 token,
                 min_refresh: min_refresh.unwrap_or(DEFAULT_IDENTITY_MIN_REFRESH),
                 max_refresh: max_refresh.unwrap_or(DEFAULT_IDENTITY_MAX_REFRESH),
+                documents: identity::client::linkerd::certify::Documents::load(dir).map_err(
+                    |error| {
+                        error!(%error, "Failed to read identity documents");
+                        EnvError::InvalidEnvVar
+                    },
+                )?,
             };
-            let docs = identity::Documents {
-                id: identity::LocalId(local_name),
-                trust_anchors_pem,
-                key_pkcs8: key?,
-                csr_der: csr?,
-            };
-            Ok((control, certify, docs))
+
+            Ok((control, certify))
         }
-        (addr, trust_anchors, end_entity_dir, local_id, token, _minr, _maxr) => {
+        (addr, end_entity_dir, token, _minr, _maxr) => {
             let s = format!("{0}_ADDR and {0}_NAME", ENV_IDENTITY_SVC_BASE);
             let svc_env: &str = s.as_str();
             for (unset, name) in &[
                 (addr.is_none(), svc_env),
-                (trust_anchors.is_none(), ENV_IDENTITY_TRUST_ANCHORS),
                 (end_entity_dir.is_none(), ENV_IDENTITY_DIR),
-                (local_id.is_none(), ENV_IDENTITY_IDENTITY_LOCAL_NAME),
                 (token.is_none(), ENV_IDENTITY_TOKEN_FILE),
             ] {
                 if *unset {
-                    error!("{} must be set.", name);
+                    error!("{name} must be set.");
                 }
             }
             Err(EnvError::InvalidEnvVar)
@@ -1392,5 +1554,98 @@ mod tests {
         assert!(parse_ip_set("10.4.0.555").is_err());
         assert!(parse_ip_set("10.4.0.3,foobar,192.168.0.69").is_err());
         assert!(parse_ip_set("10.0.1.1/24").is_err());
+    }
+
+    #[test]
+    fn ranges() {
+        fn set(
+            ranges: impl IntoIterator<Item = std::ops::RangeInclusive<u16>>,
+        ) -> Result<RangeInclusiveSet<u16>, ParseError> {
+            Ok(ranges.into_iter().collect())
+        }
+
+        assert_eq!(dbg!(parse_port_range_set("1-65535")), set([1..=65535]));
+        assert_eq!(
+            dbg!(parse_port_range_set("1-2,42-420")),
+            set([1..=2, 42..=420])
+        );
+        assert_eq!(
+            dbg!(parse_port_range_set("1-2,42,80-420")),
+            set([1..=2, 42..=42, 80..=420])
+        );
+        assert_eq!(
+            dbg!(parse_port_range_set("1,20,30,40")),
+            set([1..=1, 20..=20, 30..=30, 40..=40])
+        );
+        assert_eq!(
+            dbg!(parse_port_range_set("40,30,20,1")),
+            set([1..=1, 20..=20, 30..=30, 40..=40])
+        );
+        // ignores empty list entries
+        assert_eq!(dbg!(parse_port_range_set("1,,,,2")), set([1..=1, 2..=2]));
+        // ignores rando whitespace
+        assert_eq!(
+            dbg!(parse_port_range_set("1, 2,\t3- 5")),
+            set([1..=1, 2..=2, 3..=5])
+        );
+        assert_eq!(dbg!(parse_port_range_set("1, , 2,")), set([1..=1, 2..=2]));
+
+        // non-numeric strings
+        assert!(dbg!(parse_port_range_set("asdf")).is_err());
+        assert!(dbg!(parse_port_range_set("80, 443, http")).is_err());
+        assert!(dbg!(parse_port_range_set("80,http-443")).is_err());
+
+        // backwards ranges
+        assert!(dbg!(parse_port_range_set("80-79")).is_err());
+        assert!(dbg!(parse_port_range_set("1,2,5-2")).is_err());
+
+        // malformed (half-open) ranges
+        assert!(dbg!(parse_port_range_set("-1")).is_err());
+        assert!(dbg!(parse_port_range_set("1,2-,50")).is_err());
+
+        // not a u16
+        assert!(dbg!(parse_port_range_set("69420")).is_err());
+        assert!(dbg!(parse_port_range_set("1-69420")).is_err());
+    }
+
+    #[test]
+    fn control_stream_limits() {
+        impl Strings for HashMap<&'static str, &'static str> {
+            fn get(&self, key: &str) -> Result<Option<String>, EnvError> {
+                Ok(self.get(key).map(ToString::to_string))
+            }
+        }
+
+        let mut env = HashMap::default();
+        env.insert("LINKERD2_PROXY_CONTROL_STREAM_INITIAL_TIMEOUT", "1s");
+        env.insert("LINKERD2_PROXY_CONTROL_STREAM_IDLE_TIMEOUT", "2s");
+        env.insert("LINKERD2_PROXY_CONTROL_STREAM_LIFETIME", "3s");
+        let limits = mk_control_receive_limits(&env).unwrap();
+        assert_eq!(limits.initial, Some(Duration::from_secs(1)));
+        assert_eq!(limits.idle, Some(Duration::from_secs(2)));
+        assert_eq!(limits.lifetime, Some(Duration::from_secs(3)));
+
+        env.insert("LINKERD2_PROXY_CONTROL_STREAM_INITIAL_TIMEOUT", "");
+        env.insert("LINKERD2_PROXY_CONTROL_STREAM_IDLE_TIMEOUT", "");
+        env.insert("LINKERD2_PROXY_CONTROL_STREAM_LIFETIME", "");
+        let limits = mk_control_receive_limits(&env).unwrap();
+        assert_eq!(limits.initial, None);
+        assert_eq!(limits.idle, None);
+        assert_eq!(limits.lifetime, None);
+
+        env.insert("LINKERD2_PROXY_CONTROL_STREAM_INITIAL_TIMEOUT", "3s");
+        env.insert("LINKERD2_PROXY_CONTROL_STREAM_IDLE_TIMEOUT", "1s");
+        env.insert("LINKERD2_PROXY_CONTROL_STREAM_LIFETIME", "");
+        assert!(mk_control_receive_limits(&env).is_err());
+
+        env.insert("LINKERD2_PROXY_CONTROL_STREAM_INITIAL_TIMEOUT", "3s");
+        env.insert("LINKERD2_PROXY_CONTROL_STREAM_IDLE_TIMEOUT", "");
+        env.insert("LINKERD2_PROXY_CONTROL_STREAM_LIFETIME", "1s");
+        assert!(mk_control_receive_limits(&env).is_err());
+
+        env.insert("LINKERD2_PROXY_CONTROL_STREAM_INITIAL_TIMEOUT", "");
+        env.insert("LINKERD2_PROXY_CONTROL_STREAM_IDLE_TIMEOUT", "3s");
+        env.insert("LINKERD2_PROXY_CONTROL_STREAM_LIFETIME", "1s");
+        assert!(mk_control_receive_limits(&env).is_err());
     }
 }

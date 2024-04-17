@@ -17,6 +17,7 @@ ignore = []
 unlicensed = "deny"
 allow = [
     "Apache-2.0",
+    "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
     "MIT",
@@ -25,10 +26,25 @@ deny = []
 copyleft = "deny"
 allow-osi-fsf-free = "neither"
 default = "deny"
+# Ignore local workspace license values for unpublished crates.
+private = { ignore = true }
 confidence-threshold = 0.8
 exceptions = [
-    { allow = ["Zlib"], name = "adler32", version = "*" },
-    { allow = ["ISC", "MIT", "OpenSSL"], name = "ring", version = "*" },
+    { allow = [
+        "Zlib",
+    ], name = "adler32", version = "*" },
+    { allow = [
+        "ISC",
+        "MIT",
+        "OpenSSL",
+    ], name = "ring", version = "*" },
+    # The Unicode-DFS-2016 license is necessary for unicode-ident because they
+    # use data from the unicode tables to generate the tables which are
+    # included in the application. We do not distribute those data files so
+    # this is not a problem for us. See https://github.com/dtolnay/unicode-ident/pull/9/files
+    { allow = [
+        "Unicode-DFS-2016",
+    ], name = "unicode-ident", version = "*" },
 ]
 
 [[licenses.clarify]]
@@ -46,17 +62,37 @@ wildcards = "allow"
 highlight = "all"
 deny = [
     { name = "rustls", wrappers = ["tokio-rustls"] },
+    # rustls-webpki should be used instead.
+    { name = "webpki" },
 ]
 skip = [
-    # Waiting on a prost-build release that includes
-    # https://github.com/tokio-rs/prost/pull/583
-    { name = "heck", version = "0.3" },
-    # waiting on `h2` and `tower` releases that update h2 to v0.7
-    { name = "tokio-util", version = "0.6" },
+    # The proc-macro ecosystem is in the middle of a migration from `syn` v1 to
+    # `syn` v2. Allow both versions to coexist peacefully for now.
+    #
+    # Since `syn` is used by proc-macros (executed at compile time), duplicate
+    # versions won't have an impact on the final binary size.
+    { name = "syn" },
+    # `tonic` v0.6 depends on `bitflags` v1.x, while `boring-sys` depends on
+    # `bitflags` v2.x. Allow both versions to coexist peacefully for now.
+    { name = "bitflags", version = "1" },
+    # `linkerd-trace-context`, `rustls-pemfile` and `tonic` depend on `base64`
+    # v0.13.1 while `rcgen` depends on v0.21.5
+    { name = "base64" },
+    # https://github.com/hawkw/matchers/pull/4
+    { name = "regex-automata", version = "0.1" },
+    { name = "regex-syntax", version = "0.6" },
+    # `trust-dns-proto`, depends on `idna` v0.2.3 while `url` depends on v0.5.0
+    { name = "idna" },
+    # Some dependencies still use indexmap v1.
+    { name = "indexmap", version = "1" },
+    { name = "hashbrown", version = "0.12" },
 ]
 skip-tree = [
-    # Hasn't seen a new release since 2017. Pulls in an older version of nom.
-    { name = "procinfo" },
+    # right now we have a mix of versions of this crate in the ecosystem
+    # procfs uses 0.36.14, tempfile uses 0.37.4
+    { name = "rustix" },
+    # Hyper v0.14 depends on an older socket2 version.
+    { name = "socket2" },
 ]
 
 [sources]
@@ -65,6 +101,4 @@ unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 [sources.allow-org]
-github = [
-    "linkerd",
-]
+github = ["linkerd"]

@@ -1,9 +1,4 @@
-#![deny(
-    warnings,
-    rust_2018_idioms,
-    clippy::disallowed_methods,
-    clippy::disallowed_types
-)]
+#![deny(rust_2018_idioms, clippy::disallowed_methods, clippy::disallowed_types)]
 #![forbid(unsafe_code)]
 
 use futures::Stream;
@@ -16,20 +11,20 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     str::FromStr,
+    sync::Arc,
     task::{Context, Poll},
 };
 use thiserror::Error;
 use tokio::sync::watch;
 use tower::util::{Oneshot, ServiceExt};
 
+mod allowlist;
 mod client;
 mod default;
-pub mod discover;
 pub mod http;
 mod proto;
-pub mod split;
 
-pub use self::client::Client;
+pub use self::{allowlist::WithAllowlist, client::Client, default::RecoverDefault};
 
 #[derive(Clone, Debug)]
 pub struct Receiver {
@@ -41,24 +36,23 @@ struct ReceiverStream {
     inner: tokio_stream::wrappers::WatchStream<Profile>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Profile {
     pub addr: Option<LogicalAddr>,
-    pub http_routes: Vec<(self::http::RequestMatch, self::http::Route)>,
-    pub targets: Vec<Target>,
+    pub http_routes: Arc<[(self::http::RequestMatch, self::http::Route)]>,
+    pub targets: Arc<[Target]>,
     pub opaque_protocol: bool,
     pub endpoint: Option<(SocketAddr, Metadata)>,
 }
-
 /// A profile lookup target.
 #[derive(Clone, Hash, Eq, PartialEq)]
 pub struct LookupAddr(pub Addr);
 
 /// A bound logical service address
-#[derive(Clone, Hash, Eq, PartialEq)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct LogicalAddr(pub NameAddr);
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq, Hash)]
 pub struct Target {
     pub addr: NameAddr,
     pub weight: u32,
@@ -80,11 +74,11 @@ pub enum DiscoveryRejected {
 }
 
 /// Watches a destination's Profile.
-pub trait GetProfile<T> {
+pub trait GetProfile: Clone + Send + Sync + Unpin + 'static {
     type Error: Into<Error>;
-    type Future: Future<Output = Result<Option<Receiver>, Self::Error>>;
+    type Future: Future<Output = Result<Option<Receiver>, Self::Error>> + Send + Unpin;
 
-    fn get_profile(&mut self, target: T) -> Self::Future;
+    fn get_profile(&mut self, target: LookupAddr) -> Self::Future;
 
     fn into_service(self) -> GetProfileService<Self>
     where
@@ -94,24 +88,27 @@ pub trait GetProfile<T> {
     }
 }
 
-impl<T, S> GetProfile<T> for S
+impl<S> GetProfile for S
 where
-    S: tower::Service<T, Response = Option<Receiver>> + Clone,
+    S: tower::Service<LookupAddr, Response = Option<Receiver>>
+        + Clone
+        + Send
+        + Sync
+        + Unpin
+        + 'static,
     S::Error: Into<Error>,
+    S::Future: Send + Unpin,
 {
     type Error = S::Error;
-    type Future = Oneshot<S, T>;
+    type Future = Oneshot<S, LookupAddr>;
 
     #[inline]
-    fn get_profile(&mut self, target: T) -> Self::Future {
+    fn get_profile(&mut self, target: LookupAddr) -> Self::Future {
         self.clone().oneshot(target)
     }
 }
 
-impl<T, P> tower::Service<T> for GetProfileService<P>
-where
-    P: GetProfile<T>,
-{
+impl<P: GetProfile> tower::Service<LookupAddr> for GetProfileService<P> {
     type Response = Option<Receiver>;
     type Error = P::Error;
     type Future = P::Future;
@@ -121,7 +118,7 @@ where
     }
 
     #[inline]
-    fn call(&mut self, target: T) -> Self::Future {
+    fn call(&mut self, target: LookupAddr) -> Self::Future {
         self.0.get_profile(target)
     }
 }
@@ -131,6 +128,12 @@ where
 impl From<watch::Receiver<Profile>> for Receiver {
     fn from(inner: watch::Receiver<Profile>) -> Self {
         Self { inner }
+    }
+}
+
+impl From<Receiver> for watch::Receiver<Profile> {
+    fn from(r: Receiver) -> watch::Receiver<Profile> {
+        r.inner
     }
 }
 
@@ -145,10 +148,6 @@ impl Receiver {
 
     pub fn endpoint(&self) -> Option<(SocketAddr, Metadata)> {
         self.inner.borrow().endpoint.clone()
-    }
-
-    fn targets(&self) -> Vec<Target> {
-        self.inner.borrow().targets.clone()
     }
 }
 
@@ -167,6 +166,32 @@ impl Stream for ReceiverStream {
     #[inline]
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Pin::new(&mut self.inner).poll_next(cx)
+    }
+}
+
+// === impl Profile ===
+
+impl Default for Profile {
+    fn default() -> Self {
+        use once_cell::sync::Lazy;
+        static HTTP_ROUTES: Lazy<Arc<[(http::RequestMatch, http::Route)]>> =
+            Lazy::new(|| Arc::new([]));
+        static TARGETS: Lazy<Arc<[Target]>> = Lazy::new(|| Arc::new([]));
+        Self {
+            addr: None,
+            http_routes: HTTP_ROUTES.clone(),
+            targets: TARGETS.clone(),
+            opaque_protocol: false,
+            endpoint: None,
+        }
+    }
+}
+
+impl Profile {
+    /// Returns `true` if this profile provides configuration that should
+    /// override a client policy configuration.
+    pub fn has_routes_or_targets(&self) -> bool {
+        !self.http_routes.is_empty() || !self.targets.is_empty()
     }
 }
 
@@ -235,6 +260,14 @@ impl From<NameAddr> for LogicalAddr {
 impl From<LogicalAddr> for NameAddr {
     fn from(LogicalAddr(na): LogicalAddr) -> NameAddr {
         na
+    }
+}
+
+impl std::ops::Deref for LogicalAddr {
+    type Target = NameAddr;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
     }
 }
 

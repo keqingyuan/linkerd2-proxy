@@ -1,7 +1,8 @@
 use crate::svc;
-use http::header::HeaderValue;
+use http::header::{HeaderValue, LOCATION};
 use linkerd_error::{Error, Result};
 use linkerd_error_respond as respond;
+use linkerd_proxy_http::orig_proto;
 pub use linkerd_proxy_http::{ClientHandle, HasH2Reason};
 use linkerd_stack::ExtractParam;
 use pin_project::pin_project;
@@ -32,10 +33,11 @@ pub trait HttpRescue<E> {
 
 #[derive(Clone, Debug)]
 pub struct SyntheticHttpResponse {
-    pub grpc_status: tonic::Code,
-    pub http_status: http::StatusCode,
-    pub close_connection: bool,
-    pub message: Cow<'static, str>,
+    grpc_status: tonic::Code,
+    http_status: http::StatusCode,
+    close_connection: bool,
+    message: Cow<'static, str>,
+    location: Option<HeaderValue>,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -55,6 +57,7 @@ pub struct Respond<R> {
     rescue: R,
     version: http::Version,
     is_grpc: bool,
+    is_orig_proto_upgrade: bool,
     client: Option<ClientHandle>,
     emit_headers: bool,
 }
@@ -90,11 +93,16 @@ where
 
 impl SyntheticHttpResponse {
     pub fn unexpected_error() -> Self {
+        Self::internal_error("unexpected error")
+    }
+
+    pub fn internal_error(msg: impl Into<Cow<'static, str>>) -> Self {
         Self {
             close_connection: true,
             http_status: http::StatusCode::INTERNAL_SERVER_ERROR,
             grpc_status: tonic::Code::Internal,
-            message: Cow::Borrowed("unexpected error"),
+            message: msg.into(),
+            location: None,
         }
     }
 
@@ -104,6 +112,7 @@ impl SyntheticHttpResponse {
             http_status: http::StatusCode::BAD_GATEWAY,
             grpc_status: tonic::Code::Unavailable,
             message: Cow::Owned(msg.to_string()),
+            location: None,
         }
     }
 
@@ -113,6 +122,17 @@ impl SyntheticHttpResponse {
             http_status: http::StatusCode::GATEWAY_TIMEOUT,
             grpc_status: tonic::Code::Unavailable,
             message: Cow::Owned(msg.to_string()),
+            location: None,
+        }
+    }
+
+    pub fn unavailable(msg: impl ToString) -> Self {
+        Self {
+            close_connection: true,
+            http_status: http::StatusCode::SERVICE_UNAVAILABLE,
+            grpc_status: tonic::Code::Unavailable,
+            message: Cow::Owned(msg.to_string()),
+            location: None,
         }
     }
 
@@ -122,6 +142,7 @@ impl SyntheticHttpResponse {
             grpc_status: tonic::Code::Unauthenticated,
             close_connection: false,
             message: Cow::Owned(msg.to_string()),
+            location: None,
         }
     }
 
@@ -131,6 +152,7 @@ impl SyntheticHttpResponse {
             grpc_status: tonic::Code::PermissionDenied,
             close_connection: false,
             message: Cow::Owned(msg.to_string()),
+            location: None,
         }
     }
 
@@ -140,6 +162,7 @@ impl SyntheticHttpResponse {
             grpc_status: tonic::Code::Aborted,
             close_connection: true,
             message: Cow::Owned(msg.to_string()),
+            location: None,
         }
     }
 
@@ -149,6 +172,40 @@ impl SyntheticHttpResponse {
             grpc_status: tonic::Code::NotFound,
             close_connection: false,
             message: Cow::Owned(msg.to_string()),
+            location: None,
+        }
+    }
+
+    pub fn redirect(http_status: http::StatusCode, location: &http::Uri) -> Self {
+        Self {
+            http_status,
+            grpc_status: tonic::Code::NotFound,
+            close_connection: false,
+            message: Cow::Borrowed("redirected"),
+            location: Some(
+                HeaderValue::try_from(location.to_string())
+                    .expect("location must be a valid header value"),
+            ),
+        }
+    }
+
+    pub fn response(http_status: http::StatusCode, message: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            http_status,
+            location: None,
+            grpc_status: tonic::Code::FailedPrecondition,
+            close_connection: false,
+            message: message.into(),
+        }
+    }
+
+    pub fn grpc(grpc_status: tonic::Code, message: impl Into<Cow<'static, str>>) -> Self {
+        Self {
+            grpc_status,
+            http_status: http::StatusCode::OK,
+            location: None,
+            close_connection: false,
+            message: message.into(),
         }
     }
 
@@ -156,7 +213,7 @@ impl SyntheticHttpResponse {
     fn message(&self) -> HeaderValue {
         match self.message {
             Cow::Borrowed(msg) => HeaderValue::from_static(msg),
-            Cow::Owned(ref msg) => HeaderValue::from_str(&*msg).unwrap_or_else(|error| {
+            Cow::Owned(ref msg) => HeaderValue::from_str(msg).unwrap_or_else(|error| {
                 warn!(%error, "Failed to encode error header");
                 HeaderValue::from_static("unexpected error")
             }),
@@ -192,8 +249,14 @@ impl SyntheticHttpResponse {
         &self,
         version: http::Version,
         emit_headers: bool,
+        is_orig_proto_upgrade: bool,
     ) -> http::Response<B> {
-        debug!(status = %self.http_status, ?version, close = %self.close_connection, "Handling error on HTTP connection");
+        debug!(
+            status = %self.http_status,
+            ?version,
+            close = %self.close_connection,
+            "Handling error on HTTP connection"
+        );
         let mut rsp = http::Response::builder()
             .status(self.http_status)
             .version(version)
@@ -204,7 +267,7 @@ impl SyntheticHttpResponse {
         }
 
         if self.close_connection {
-            if version == http::Version::HTTP_11 {
+            if version == http::Version::HTTP_11 && !is_orig_proto_upgrade {
                 // Notify the (proxy or non-proxy) client that the connection will be closed.
                 rsp = rsp.header(http::header::CONNECTION, "close");
             }
@@ -215,6 +278,10 @@ impl SyntheticHttpResponse {
                 // TODO only set when meshed.
                 rsp = rsp.header(L5D_PROXY_CONNECTION, "close");
             }
+        }
+
+        if let Some(loc) = &self.location {
+            rsp = rsp.header(LOCATION, loc);
         }
 
         rsp.body(B::default())
@@ -265,17 +332,22 @@ where
                     client,
                     rescue,
                     is_grpc,
+                    is_orig_proto_upgrade: false,
                     version: http::Version::HTTP_2,
                     emit_headers,
                 }
             }
-            version => Respond {
-                client,
-                rescue,
-                version,
-                is_grpc: false,
-                emit_headers,
-            },
+            version => {
+                let is_h2_upgrade = req.extensions().get::<orig_proto::WasUpgrade>().is_some();
+                Respond {
+                    client,
+                    rescue,
+                    version,
+                    is_grpc: false,
+                    is_orig_proto_upgrade: is_h2_upgrade,
+                    emit_headers,
+                }
+            }
         }
     }
 }
@@ -323,7 +395,12 @@ where
         };
 
         let rsp = info_span!("rescue", client.addr = %self.client_addr()).in_scope(|| {
-            tracing::info!(%error, "Request failed");
+            if !self.is_grpc {
+                let version = self.version;
+                tracing::info!(error, "{version:?} request failed",);
+            } else {
+                tracing::info!(error, "gRPC request failed");
+            };
             self.rescue.rescue(error)
         })?;
 
@@ -338,7 +415,7 @@ where
         let rsp = if self.is_grpc {
             rsp.grpc_response(self.emit_headers)
         } else {
-            rsp.http_response(self.version, self.emit_headers)
+            rsp.http_response(self.version, self.emit_headers, self.is_orig_proto_upgrade)
         };
 
         Ok(rsp)
@@ -382,7 +459,7 @@ where
                             message,
                             ..
                         } = rescue.rescue(error)?;
-                        let t = Self::grpc_trailers(grpc_status, &*message, *emit_headers);
+                        let t = Self::grpc_trailers(grpc_status, &message, *emit_headers);
                         *trailers = Some(t);
                         Poll::Ready(None)
                     }

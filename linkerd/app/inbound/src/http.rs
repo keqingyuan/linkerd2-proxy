@@ -15,10 +15,7 @@ pub mod fuzz {
     use crate::{
         http::router::Http,
         policy,
-        test_util::{
-            support::{connect::Connect, http_util, profile, resolver},
-            *,
-        },
+        test_util::{support::connect::Connect, *},
         Config, Inbound,
     };
     use hyper::{client::conn::Builder as ClientBuilder, Body, Request, Response};
@@ -33,7 +30,7 @@ pub mod fuzz {
     };
     pub use linkerd_app_test as support;
     use linkerd_app_test::*;
-    use std::{fmt, str};
+    use std::{fmt, str, sync::Arc};
 
     #[derive(Arbitrary)]
     pub struct HttpRequestSpec {
@@ -131,6 +128,7 @@ pub mod fuzz {
             .with_stack(connect)
             .push_http_router(profiles)
             .push_http_server()
+            .push_http_tcp_server()
             .into_inner()
     }
 
@@ -212,13 +210,24 @@ pub mod fuzz {
             let (policy, _) = policy::AllowPolicy::for_test(
                 self.param(),
                 policy::ServerPolicy {
-                    protocol: policy::Protocol::Http1,
-                    authorizations: vec![policy::Authorization {
-                        authentication: policy::Authentication::Unauthenticated,
-                        networks: vec![std::net::IpAddr::from([192, 0, 2, 3]).into()],
-                        name: "testsaz".into(),
-                    }],
-                    name: "testsrv".into(),
+                    protocol: policy::Protocol::Http1(Arc::new([
+                        linkerd_proxy_server_policy::http::default(Arc::new([
+                            policy::Authorization {
+                                authentication: policy::Authentication::Unauthenticated,
+                                networks: vec![std::net::IpAddr::from([192, 0, 2, 3]).into()],
+                                meta: Arc::new(policy::Meta::Resource {
+                                    group: "policy.linkerd.io".into(),
+                                    kind: "server".into(),
+                                    name: "testsaz".into(),
+                                }),
+                            },
+                        ])),
+                    ])),
+                    meta: Arc::new(policy::Meta::Resource {
+                        group: "policy.linkerd.io".into(),
+                        kind: "server".into(),
+                        name: "testsrv".into(),
+                    }),
                 },
             );
             policy
@@ -227,7 +236,11 @@ pub mod fuzz {
 
     impl svc::Param<policy::ServerLabel> for Target {
         fn param(&self) -> policy::ServerLabel {
-            policy::ServerLabel("testsrv".into())
+            policy::ServerLabel(Arc::new(policy::Meta::Resource {
+                group: "policy.linkerd.io".into(),
+                kind: "server".into(),
+                name: "testsrv".into(),
+            }))
         }
     }
 
@@ -237,8 +250,8 @@ pub mod fuzz {
         }
     }
 
-    impl svc::Param<Option<identity::Name>> for Target {
-        fn param(&self) -> Option<identity::Name> {
+    impl svc::Param<Option<identity::Id>> for Target {
+        fn param(&self) -> Option<identity::Id> {
             None
         }
     }

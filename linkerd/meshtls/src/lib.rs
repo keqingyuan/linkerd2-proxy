@@ -1,9 +1,5 @@
-#![deny(
-    warnings,
-    rust_2018_idioms,
-    clippy::disallowed_methods,
-    clippy::disallowed_types
-)]
+#![deny(rust_2018_idioms, clippy::disallowed_methods, clippy::disallowed_types)]
+#![allow(clippy::large_enum_variant)]
 #![forbid(unsafe_code)]
 
 //! This crate provides a static interface for the proxy's x509 certificate
@@ -24,8 +20,9 @@ pub use self::{
     client::{ClientIo, Connect, ConnectFuture, NewClient},
     server::{Server, ServerIo, TerminateFuture},
 };
+use linkerd_dns_name as dns;
 use linkerd_error::{Error, Result};
-use linkerd_identity::Name;
+use linkerd_identity as id;
 use std::str::FromStr;
 
 #[cfg(feature = "boring")]
@@ -86,15 +83,14 @@ impl Default for Mode {
 impl Mode {
     pub fn watch(
         self,
-        identity: Name,
+        local_id: id::Id,
+        server_name: dns::Name,
         roots_pem: &str,
-        key_pkcs8: &[u8],
-        csr: &[u8],
     ) -> Result<(creds::Store, creds::Receiver)> {
         match self {
             #[cfg(feature = "boring")]
             Self::Boring => {
-                let (store, receiver) = boring::creds::watch(identity, roots_pem, key_pkcs8, csr)?;
+                let (store, receiver) = boring::creds::watch(local_id, server_name, roots_pem)?;
                 Ok((
                     creds::Store::Boring(store),
                     creds::Receiver::Boring(receiver),
@@ -103,7 +99,7 @@ impl Mode {
 
             #[cfg(feature = "rustls")]
             Self::Rustls => {
-                let (store, receiver) = rustls::creds::watch(identity, roots_pem, key_pkcs8, csr)?;
+                let (store, receiver) = rustls::creds::watch(local_id, server_name, roots_pem)?;
                 Ok((
                     creds::Store::Rustls(store),
                     creds::Receiver::Rustls(receiver),
@@ -111,7 +107,7 @@ impl Mode {
             }
 
             #[cfg(not(feature = "__has_any_tls_impls"))]
-            _ => no_tls!(identity, roots_pem, key_pkcs8, csr),
+            _ => no_tls!(local_id, server_name, roots_pem),
         }
     }
 }

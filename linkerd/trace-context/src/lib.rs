@@ -1,9 +1,4 @@
-#![deny(
-    warnings,
-    rust_2018_idioms,
-    clippy::disallowed_methods,
-    clippy::disallowed_types
-)]
+#![deny(rust_2018_idioms, clippy::disallowed_methods, clippy::disallowed_types)]
 #![forbid(unsafe_code)]
 
 mod propagation;
@@ -14,7 +9,6 @@ use bytes::Bytes;
 use linkerd_error::Error;
 use rand::Rng;
 use std::collections::HashMap;
-use std::convert::TryFrom;
 use std::fmt;
 use std::time::SystemTime;
 use thiserror::Error;

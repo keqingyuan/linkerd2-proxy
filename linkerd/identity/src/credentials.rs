@@ -1,15 +1,8 @@
-use crate::Name;
 use linkerd_error::Result;
 use std::{ops::Deref, time::SystemTime};
 
 /// Publishes certificates to be used by TLS implementations.
 pub trait Credentials {
-    /// Get the authoritative DNS-like name used in the certificate.
-    fn dns_name(&self) -> &Name;
-
-    /// Generate a CSR to to be sent to the identity service.
-    fn gen_certificate_signing_request(&mut self) -> DerX509;
-
     /// Set the certificate returned by the identity service.
     ///
     /// Fails if the certificate is not valid.
@@ -17,6 +10,7 @@ pub trait Credentials {
         &mut self,
         leaf: DerX509,
         chain: Vec<DerX509>,
+        key: Vec<u8>,
         expiry: SystemTime,
     ) -> Result<()>;
 }
@@ -37,6 +31,6 @@ impl Deref for DerX509 {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
-        &*self.0
+        &self.0
     }
 }

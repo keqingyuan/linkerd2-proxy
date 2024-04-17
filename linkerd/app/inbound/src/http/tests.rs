@@ -6,10 +6,11 @@ use crate::{
     },
     Config, Inbound,
 };
-use hyper::{client::conn::Builder as ClientBuilder, Body, Request, Response};
+use hyper::{body::HttpBody, client::conn::Builder as ClientBuilder, Body, Request, Response};
 use linkerd_app_core::{
+    classify,
     errors::respond::L5D_PROXY_ERROR,
-    identity, io,
+    identity, io, metrics,
     proxy::http,
     svc::{self, NewService, Param},
     tls,
@@ -18,7 +19,8 @@ use linkerd_app_core::{
 };
 use linkerd_app_test::connect::ConnectFuture;
 use linkerd_tracing::test::trace_init;
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
+use tokio::time;
 use tracing::Instrument;
 
 fn build_server<I>(
@@ -38,6 +40,7 @@ where
         })
         .push_http_router(profiles)
         .push_http_server()
+        .push_http_tcp_server()
         .into_inner()
 }
 
@@ -181,11 +184,11 @@ async fn http1_bad_gateway_meshed_response_error_header() {
         .unwrap();
     let response = http_util::http_request(&mut client, req).await.unwrap();
     assert_eq!(response.status(), http::StatusCode::BAD_GATEWAY);
-    let message = response
-        .headers()
-        .get(L5D_PROXY_ERROR)
-        .expect("response did not contain L5D_PROXY_ERROR header");
-    assert_eq!(message, "server is not listening");
+    // NOTE: this does not include a stack error context for that endpoint
+    // because we don't build a real HTTP endpoint stack, which adds error
+    // context to this error, and the client rescue layer is below where the
+    // logical error context is added.
+    check_error_header(response.headers(), "server is not listening");
 
     drop(client);
     bg.await.expect("background task failed");
@@ -259,11 +262,12 @@ async fn http1_connect_timeout_meshed_response_error_header() {
         .unwrap();
     let response = http_util::http_request(&mut client, req).await.unwrap();
     assert_eq!(response.status(), http::StatusCode::GATEWAY_TIMEOUT);
-    let message = response
-        .headers()
-        .get(L5D_PROXY_ERROR)
-        .expect("response did not contain L5D_PROXY_ERROR header");
-    assert_eq!(message, "connect timed out after 1s");
+
+    // NOTE: this does not include a stack error context for that endpoint
+    // because we don't build a real HTTP endpoint stack, which adds error
+    // context to this error, and the client rescue layer is below where the
+    // logical error context is added.
+    check_error_header(response.headers(), "connect timed out after 1s");
 
     drop(client);
     bg.await.expect("background task failed");
@@ -337,11 +341,8 @@ async fn h2_response_meshed_error_header() {
         .unwrap();
     let response = http_util::http_request(&mut client, req).await.unwrap();
     assert_eq!(response.status(), http::StatusCode::GATEWAY_TIMEOUT);
-    let message = response
-        .headers()
-        .get(L5D_PROXY_ERROR)
-        .expect("response did not contain L5D_PROXY_ERROR header");
-    assert_eq!(message, "HTTP Logical service in fail-fast");
+
+    check_error_header(response.headers(), "service in fail-fast");
 
     // Drop the client and discard the result of awaiting the proxy background
     // task. The result is discarded because it hits an error that is related
@@ -419,11 +420,8 @@ async fn grpc_meshed_response_error_header() {
         .unwrap();
     let response = http_util::http_request(&mut client, req).await.unwrap();
     assert_eq!(response.status(), http::StatusCode::OK);
-    let message = response
-        .headers()
-        .get(L5D_PROXY_ERROR)
-        .expect("response did not contain L5D_PROXY_ERROR header");
-    assert_eq!(message, "HTTP Logical service in fail-fast");
+
+    check_error_header(response.headers(), "service in fail-fast");
 
     // Drop the client and discard the result of awaiting the proxy background
     // task. The result is discarded because it hits an error that is related
@@ -473,6 +471,84 @@ async fn grpc_unmeshed_response_error_header() {
     let _ = bg.await;
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn grpc_response_class() {
+    let _trace = trace_init();
+
+    // Build a mock connector serves a gRPC server that returns errors.
+    let connect = {
+        let mut server = hyper::server::conn::Http::new();
+        server.http2_only(true);
+        support::connect().endpoint_fn_boxed(
+            Target::addr(),
+            grpc_status_server(server, tonic::Code::Unknown),
+        )
+    };
+
+    // Build a client using the connect that always errors.
+    let mut client = ClientBuilder::new();
+    client.http2_only(true);
+    let profiles = profile::resolver();
+    let profile_tx =
+        profiles.profile_tx(NameAddr::from_str_and_port("foo.svc.cluster.local", 5550).unwrap());
+    profile_tx.send(profile::Profile::default()).unwrap();
+    let cfg = default_config();
+    let (rt, _shutdown) = runtime();
+    let metrics = rt
+        .metrics
+        .clone()
+        .http_endpoint
+        .into_report(time::Duration::from_secs(3600));
+    let server = build_server(cfg, rt, profiles, connect).new_service(Target::meshed_h2());
+    let (mut client, bg) = http_util::connect_and_accept(&mut client, server).await;
+
+    // Send a request and assert that it is OK with the expected header
+    // message.
+    let req = Request::builder()
+        .method(http::Method::POST)
+        .uri("http://foo.svc.cluster.local:5550")
+        .header(http::header::CONTENT_TYPE, "application/grpc")
+        .body(Body::default())
+        .unwrap();
+
+    let mut response = http_util::http_request(&mut client, req).await.unwrap();
+    assert_eq!(response.status(), http::StatusCode::OK);
+
+    response.body_mut().data().await;
+    let trls = response.body_mut().trailers().await.unwrap().unwrap();
+    assert_eq!(trls.get("grpc-status").unwrap().to_str().unwrap(), "2");
+
+    let response_total = metrics
+        .get_response_total(
+            &metrics::EndpointLabels::Inbound(metrics::InboundEndpointLabels {
+                tls: Target::meshed_h2().1,
+                authority: Some("foo.svc.cluster.local:5550".parse().unwrap()),
+                target_addr: "127.0.0.1:80".parse().unwrap(),
+                policy: metrics::RouteAuthzLabels {
+                    route: metrics::RouteLabels {
+                        server: metrics::ServerLabel(Arc::new(policy::Meta::Resource {
+                            group: "policy.linkerd.io".into(),
+                            kind: "server".into(),
+                            name: "testsrv".into(),
+                        })),
+                        route: policy::Meta::new_default("default"),
+                    },
+                    authz: Arc::new(policy::Meta::Resource {
+                        group: "policy.linkerd.io".into(),
+                        kind: "serverauthorization".into(),
+                        name: "testsaz".into(),
+                    }),
+                },
+            }),
+            Some(http::StatusCode::OK),
+            &classify::Class::Grpc(Err(tonic::Code::Unknown)),
+        )
+        .expect("response_total not found");
+    assert_eq!(response_total, 1.0);
+
+    drop((client, bg));
+}
+
 #[tracing::instrument]
 fn hello_server(
     http: hyper::server::conn::Http,
@@ -489,6 +565,42 @@ fn hello_server(
         tokio::spawn(
             http.serve_connection(server_io, hello_svc)
                 .in_current_span(),
+        );
+        Ok(io::BoxedIo::new(client_io))
+    }
+}
+
+#[tracing::instrument]
+fn grpc_status_server(
+    http: hyper::server::conn::Http,
+    status: tonic::Code,
+) -> impl Fn(Remote<ServerAddr>) -> io::Result<io::BoxedIo> {
+    move |endpoint| {
+        let span = tracing::info_span!("grpc_status_server", ?endpoint);
+        let _e = span.enter();
+        tracing::info!("mock connecting");
+        let (client_io, server_io) = support::io::duplex(4096);
+        tokio::spawn(
+            http.serve_connection(
+                server_io,
+                hyper::service::service_fn(move |request: Request<Body>| async move {
+                    tracing::info!(?request);
+                    let (mut tx, rx) = Body::channel();
+                    tokio::spawn(async move {
+                        let mut trls = ::http::HeaderMap::new();
+                        trls.insert("grpc-status", (status as u32).to_string().parse().unwrap());
+                        tx.send_trailers(trls).await
+                    });
+                    Ok::<_, io::Error>(
+                        http::Response::builder()
+                            .version(::http::Version::HTTP_2)
+                            .header("content-type", "application/grpc")
+                            .body(rx)
+                            .unwrap(),
+                    )
+                }),
+            )
+            .in_current_span(),
         );
         Ok(io::BoxedIo::new(client_io))
     }
@@ -525,6 +637,19 @@ fn connect_timeout(
 
 #[derive(Clone, Debug)]
 struct Target(http::Version, tls::ConditionalServerTls);
+
+#[track_caller]
+fn check_error_header(hdrs: &::http::HeaderMap, expected: &str) {
+    let message = hdrs
+        .get(L5D_PROXY_ERROR)
+        .expect("response did not contain l5d-proxy-error header")
+        .to_str()
+        .expect("l5d-proxy-error header should always be a UTF-8 string");
+    assert!(
+        message.contains(expected),
+        "expected {L5D_PROXY_ERROR} to contain {expected:?}; got: {message:?}",
+    );
+}
 
 // === impl Target ===
 
@@ -603,16 +728,26 @@ impl svc::Param<tls::ConditionalServerTls> for Target {
 
 impl svc::Param<policy::AllowPolicy> for Target {
     fn param(&self) -> policy::AllowPolicy {
+        let authorizations = Arc::new([policy::Authorization {
+            authentication: policy::Authentication::Unauthenticated,
+            networks: vec![std::net::IpAddr::from([192, 0, 2, 3]).into()],
+            meta: Arc::new(policy::Meta::Resource {
+                group: "policy.linkerd.io".into(),
+                kind: "serverauthorization".into(),
+                name: "testsaz".into(),
+            }),
+        }]);
         let (policy, _) = policy::AllowPolicy::for_test(
             self.param(),
             policy::ServerPolicy {
-                protocol: policy::Protocol::Http1,
-                authorizations: vec![policy::Authorization {
-                    authentication: policy::Authentication::Unauthenticated,
-                    networks: vec![std::net::IpAddr::from([192, 0, 2, 3]).into()],
-                    name: "testsaz".into(),
-                }],
-                name: "testsrv".into(),
+                protocol: policy::Protocol::Http1(Arc::new([
+                    linkerd_proxy_server_policy::http::default(authorizations),
+                ])),
+                meta: Arc::new(policy::Meta::Resource {
+                    group: "policy.linkerd.io".into(),
+                    kind: "server".into(),
+                    name: "testsrv".into(),
+                }),
             },
         );
         policy
@@ -621,7 +756,11 @@ impl svc::Param<policy::AllowPolicy> for Target {
 
 impl svc::Param<policy::ServerLabel> for Target {
     fn param(&self) -> policy::ServerLabel {
-        policy::ServerLabel("testsrv".into())
+        policy::ServerLabel(Arc::new(policy::Meta::Resource {
+            group: "policy.linkerd.io".into(),
+            kind: "server".into(),
+            name: "testsrv".into(),
+        }))
     }
 }
 
@@ -631,8 +770,8 @@ impl svc::Param<http::normalize_uri::DefaultAuthority> for Target {
     }
 }
 
-impl svc::Param<Option<identity::Name>> for Target {
-    fn param(&self) -> Option<identity::Name> {
+impl svc::Param<Option<identity::Id>> for Target {
+    fn param(&self) -> Option<identity::Id> {
         None
     }
 }

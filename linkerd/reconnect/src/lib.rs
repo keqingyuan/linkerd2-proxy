@@ -1,16 +1,11 @@
 //! Conditionally reconnects with a pluggable recovery/backoff strategy.
-#![deny(
-    warnings,
-    rust_2018_idioms,
-    clippy::disallowed_methods,
-    clippy::disallowed_types
-)]
+#![deny(rust_2018_idioms, clippy::disallowed_methods, clippy::disallowed_types)]
 #![forbid(unsafe_code)]
 
 #[cfg(test)]
 mod tests;
 
-use futures::{future, prelude::*, ready};
+use futures::{prelude::*, ready};
 use linkerd_error::{Error, Recover};
 use linkerd_stack::{layer, NewService, Service};
 use std::task::{Context, Poll};
@@ -113,7 +108,7 @@ where
                     Err(e) => {
                         // If the service fails, try to recover.
                         let error: Error = e.into();
-                        warn!(%error, "Service failed");
+                        warn!(error, "Service failed");
                         let backoff = self.recover.recover(error)?;
                         debug!("Recovering");
                         State::Disconnected {
@@ -137,7 +132,7 @@ where
                         // If the service cannot be built, try to recover using
                         // the existing backoff.
                         let error: Error = e.into();
-                        warn!(%error, "Failed to connect");
+                        warn!(error, "Failed to connect");
                         let new_backoff = self.recover.recover(error)?;
                         debug!("Recovering");
                         State::Disconnected {

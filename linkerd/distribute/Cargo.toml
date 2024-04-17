@@ -1,0 +1,19 @@
+[package]
+name = "linkerd-distribute"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+ahash = "0.8"
+indexmap = "2"
+linkerd-stack = { path = "../stack" }
+parking_lot = "0.12"
+rand = { version = "0.8", features = ["small_rng"] }
+tokio = { version = "1", features = ["macros"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tokio-test = "0.4"
+tower-test = "0.4"

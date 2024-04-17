@@ -1,6 +1,5 @@
 use crate::*;
 use std::error::Error as _;
-use tokio::sync::mpsc;
 use tokio::time::timeout;
 
 #[tokio::test]
@@ -8,15 +7,15 @@ async fn outbound_http1() {
     let _trace = trace_init();
 
     let srv = server::http1().route("/", "hello h1").run().await;
-    let ctrl = controller::new();
-    let _profile = ctrl.profile_tx_default(srv.addr, "transparency.test.svc.cluster.local");
-    let dest = ctrl.destination_tx(format!(
+    let dstctl = controller::new();
+    let _profile = dstctl.profile_tx_default(srv.addr, "transparency.test.svc.cluster.local");
+    let dest = dstctl.destination_tx(format!(
         "transparency.test.svc.cluster.local:{}",
         srv.addr.port()
     ));
     dest.send_addr(srv.addr);
     let proxy = proxy::new()
-        .controller(ctrl.run().await)
+        .controller(dstctl.run().await)
         .outbound(srv)
         .run()
         .await;
@@ -32,10 +31,10 @@ async fn inbound_http1() {
     let _trace = trace_init();
 
     let srv = server::http1().route("/", "hello h1").run().await;
-    let ctrl = controller::new();
-    let _profile = ctrl.profile_tx_default(srv.addr, "transparency.test.svc.cluster.local");
+    let dstctl = controller::new();
+    let _profile = dstctl.profile_tx_default(srv.addr, "transparency.test.svc.cluster.local");
     let proxy = proxy::new()
-        .controller(ctrl.run().await)
+        .controller(dstctl.run().await)
         .inbound(srv)
         .run()
         .await;
@@ -60,12 +59,12 @@ async fn outbound_tcp() {
         })
         .run()
         .await;
-    let ctrl = controller::new();
-    let _profile = ctrl.profile_tx_default(srv.addr, &srv.addr.to_string());
-    let dest = ctrl.destination_tx(&srv.addr.to_string());
+    let dstctl = controller::new();
+    let _profile = dstctl.profile_tx_default(srv.addr, &srv.addr.to_string());
+    let dest = dstctl.destination_tx(srv.addr.to_string());
     dest.send_addr(srv.addr);
     let proxy = proxy::new()
-        .controller(ctrl.run().await)
+        .controller(dstctl.run().await)
         .outbound(srv)
         .run()
         .await;
@@ -98,13 +97,13 @@ async fn outbound_tcp_external() {
         })
         .run()
         .await;
-    let ctrl = controller::new();
-    let profile = ctrl.profile_tx(&srv.addr.to_string());
+    let dstctl = controller::new();
+    let profile = dstctl.profile_tx(srv.addr.to_string());
     profile.send_err(grpc::Status::invalid_argument(
         "we're pretending this is outside of the cluster",
     ));
     let proxy = proxy::new()
-        .controller(ctrl.run().await)
+        .controller(dstctl.run().await)
         .outbound(srv)
         .run()
         .await;
@@ -197,27 +196,12 @@ async fn loop_inbound_http1() {
     assert_eq!(rsp.status(), http::StatusCode::FORBIDDEN);
 }
 
-async fn test_server_speaks_first(env: TestEnv) {
-    const TIMEOUT: Duration = Duration::from_secs(5);
-
+async fn test_inbound_server_speaks_first(env: TestEnv) {
     let _trace = trace_init();
 
-    let msg1 = "custom tcp server starts";
-    let msg2 = "custom tcp client second";
-
-    let (tx, mut rx) = mpsc::channel(1);
+    let (tx, rx) = mpsc::channel(1);
     let srv = server::tcp()
-        .accept_fut(move |mut sock| {
-            async move {
-                sock.write_all(msg1.as_bytes()).await?;
-                let mut vec = vec![0; 512];
-                let n = sock.read(&mut vec).await?;
-                assert_eq!(s(&vec[..n]), msg2);
-                tx.send(()).await.unwrap();
-                Ok::<(), io::Error>(())
-            }
-            .map(|res| res.expect("TCP server must not fail"))
-        })
+        .accept_fut(move |sock| serve_server_first(sock, tx))
         .run()
         .await;
 
@@ -227,30 +211,48 @@ async fn test_server_speaks_first(env: TestEnv) {
         .run_with_test_env(env)
         .await;
 
-    let client = client::tcp(proxy.inbound);
-
-    let tcp_client = client.connect().await;
-
-    assert_eq!(s(&tcp_client.read_timeout(TIMEOUT).await), msg1);
-    tcp_client.write(msg2).await;
-    timeout(TIMEOUT, rx.recv()).await.unwrap();
-
-    // TCP client must close first
-    tcp_client.shutdown().await;
+    server_first_client(proxy.inbound, rx).await;
 
     // ensure panics from the server are propagated
     proxy.join_servers().await;
 }
 
 #[tokio::test]
-async fn tcp_server_first() {
-    test_server_speaks_first(TestEnv::default()).await;
+async fn inbound_tcp_server_first() {
+    test_inbound_server_speaks_first(TestEnv::default()).await;
+}
+
+/// Like `tcp_server_first`, but the opaque port configuration is not discovered
+/// from the policy controller before accepting the connection (i.e. the port is
+/// *not* in `LINKERD2_PROXY_INBOUND_PORTS`).
+#[tokio::test]
+async fn inbound_tcp_server_first_no_discovery() {
+    let _trace = trace_init();
+
+    let (tx, rx) = mpsc::channel(1);
+    let srv = server::tcp()
+        .accept_fut(move |sock| serve_server_first(sock, tx))
+        .run()
+        .await;
+
+    let mut env = TestEnv::default();
+    env.put(
+        app::env::ENV_INBOUND_PORTS_DISABLE_PROTOCOL_DETECTION,
+        srv.addr.port().to_string(),
+    );
+
+    let proxy = proxy::new().inbound(srv).run_with_test_env(env).await;
+
+    server_first_client(proxy.inbound, rx).await;
+
+    // ensure panics from the server are propagated
+    proxy.join_servers().await;
 }
 
 // FIXME(ver) this test doesn't actually test TLS functionality.
 #[ignore]
 #[tokio::test]
-async fn tcp_server_first_tls() {
+async fn inbound_tcp_server_first_tls() {
     use std::path::PathBuf;
 
     let (_cert, _key, _trust_anchors) = {
@@ -289,9 +291,88 @@ async fn tcp_server_first_tls() {
     //    "foo.deployment.ns1.linkerd-managed.linkerd.svc.cluster.local".to_string(),
     //);
 
-    test_server_speaks_first(env).await
+    test_inbound_server_speaks_first(env).await
 }
 
+/// Tests that the outbound proxy does not attempt to perform protocol detection
+/// when the policy controller returns an `OutboundPolicy` indicating that the
+/// destination is opaque.
+#[tokio::test]
+async fn outbound_opaque_tcp_server_first() {
+    let _trace = trace_init();
+
+    let (tx, rx) = mpsc::channel(1);
+    let srv = server::tcp()
+        .accept_fut(move |sock| serve_server_first(sock, tx))
+        .run()
+        .await;
+    let name = format!("opaque.test.svc.cluster.local:{}", srv.addr.port());
+    let dstctl = controller::new();
+    let profile = dstctl.profile_tx(srv.addr);
+    profile.send(controller::pb::DestinationProfile {
+        fully_qualified_name: name.clone(),
+        ..Default::default()
+    });
+    let dest = dstctl.destination_tx(name.clone());
+    dest.send_addr(srv.addr);
+    let policy = controller::policy().outbound(
+        srv.addr,
+        policy::outbound::OutboundPolicy {
+            protocol: Some(policy::outbound::ProxyProtocol {
+                kind: Some(policy::outbound::proxy_protocol::Kind::Opaque(
+                    policy::outbound::proxy_protocol::Opaque {
+                        routes: vec![policy::outbound_default_opaque_route(name.clone())],
+                    },
+                )),
+            }),
+            ..policy::outbound_default(name)
+        },
+    );
+    let proxy = proxy::new()
+        .controller(dstctl.run().await)
+        .policy(policy.run().await)
+        .outbound(srv)
+        .run()
+        .await;
+
+    server_first_client(proxy.outbound, rx).await;
+
+    // ensure panics from the server are propagated
+    proxy.join_servers().await;
+}
+
+const SERVER_FIRST_MSG1: &str = "custom tcp server starts";
+const SERVER_FIRST_MSG2: &str = "custom tcp client second";
+
+async fn serve_server_first(mut sock: tokio::net::TcpStream, tx: mpsc::Sender<()>) {
+    async move {
+        sock.write_all(SERVER_FIRST_MSG1.as_bytes()).await?;
+        let mut vec = vec![0; 512];
+        let n = sock.read(&mut vec).await?;
+        assert_eq!(s(&vec[..n]), SERVER_FIRST_MSG2);
+        tx.send(()).await.unwrap();
+        Ok::<_, std::io::Error>(())
+    }
+    .map(|res| res.expect("TCP server must not fail"))
+    .await
+}
+
+async fn server_first_client(addr: SocketAddr, mut rx: mpsc::Receiver<()>) {
+    const TIMEOUT: Duration = Duration::from_secs(5);
+    let client = client::tcp(addr);
+
+    let tcp_client = client.connect().await;
+
+    assert_eq!(
+        s(&tcp_client.read_timeout(TIMEOUT).await),
+        SERVER_FIRST_MSG1
+    );
+    tcp_client.write(SERVER_FIRST_MSG2).await;
+    timeout(TIMEOUT, rx.recv()).await.unwrap();
+
+    // TCP client must close first
+    tcp_client.shutdown().await;
+}
 #[tokio::test]
 async fn tcp_connections_close_if_client_closes() {
     let _trace = trace_init();
@@ -643,6 +724,98 @@ macro_rules! http1_tests {
                                ";
             let connect_res = b"\
                                HTTP/1.1 200 OK\r\n\
+                               \r\n\
+                               ";
+
+            let tunneled_req = b"{send}: hi all\n";
+            let tunneled_res = b"{recv}: welcome!\n";
+
+            let srv = server::tcp()
+                .accept_fut(move |mut sock| {
+                    async move {
+                        // Read connect_req...
+                        let mut vec = vec![0; 512];
+                        let n = sock.read(&mut vec).await?;
+                        let head = s(&vec[..n]);
+                        assert_contains!(
+                            head,
+                            "CONNECT transparency.test.svc.cluster.local HTTP/1.1\r\n"
+                        );
+
+                        // Write connect_res back...
+                        sock.write_all(&connect_res[..]).await?;
+
+                        // Read the message after tunneling...
+                        let mut vec = vec![0; 512];
+                        let n = sock.read(&mut vec).await?;
+                        assert_eq!(s(&vec[..n]), s(&tunneled_req[..]));
+
+                        // Some processing... and then write back tunneled res...
+                        sock.write_all(&tunneled_res[..]).await
+                    }
+                    .map(|res: std::io::Result<()>| match res {
+                        Ok(()) => {}
+                        Err(e) => panic!("tcp server error: {}", e),
+                    })
+                })
+                .run()
+                .await;
+            let mk = $proxy;
+            let proxy = mk(srv).await;
+
+            let client = client::tcp(proxy.inbound);
+
+            let tcp_client = client.connect().await;
+
+            tcp_client.write(&connect_req[..]).await;
+
+            let resp = tcp_client.read().await;
+            let resp_str = s(&resp);
+            assert!(
+                resp_str.starts_with("HTTP/1.1 200 OK\r\n"),
+                "response not an upgrade: {:?}",
+                resp_str
+            );
+
+            // We've CONNECTed from HTTP to foo.bar! Say hi!
+            tcp_client.write(&tunneled_req[..]).await;
+            // Did anyone respond?
+            let resp2 = tcp_client.read().await;
+            assert_eq!(s(&resp2), s(&tunneled_res[..]));
+
+            // TCP client must close first
+            tcp_client.shutdown().await;
+
+            // ensure panics from the server are propagated
+            proxy.join_servers().await;
+        }
+
+        /// Tests that the proxy drops headers that can't be used in CONNECT responses.
+        ///
+        /// Exercises https://tools.ietf.org/html/rfc7231#section-4.3.6:
+        ///
+        ///     A client MUST ignore any Content-Length or Transfer-Encoding
+        ///     header fields received in a successful response to CONNECT.
+        ///
+        /// Reproduces https://github.com/linkerd/linkerd2/issues/8539
+        #[tokio::test]
+        async fn http11_connect_headers_stripped() {
+            let _trace = trace_init();
+
+            // To simplify things for this test, we just use the test TCP
+            // client and server to do an HTTP CONNECT.
+            //
+            // We don't *actually* perfom a new connect to requested host,
+            // but client doesn't need to know that for our tests.
+
+            let connect_req = b"\
+                               CONNECT transparency.test.svc.cluster.local HTTP/1.1\r\n\
+                               Host: transparency.test.svc.cluster.local\r\n\
+                               \r\n\
+                               ";
+            let connect_res = b"\
+                               HTTP/1.1 200 OK\r\n\
+                               content-length: 0\r\n\
                                \r\n\
                                ";
 
@@ -1104,9 +1277,9 @@ mod one_proxy {
     use crate::*;
 
     http1_tests! { proxy: |srv: server::Listening| async move {
-        let ctrl = controller::new();
-        let _profile = ctrl.profile_tx_default(srv.addr, "transparency.test.svc.cluster.local");
-        proxy::new().inbound(srv).controller(ctrl.run().await).run().await
+        let dstctl = controller::new();
+        let _profile = dstctl.profile_tx_default(srv.addr, "transparency.test.svc.cluster.local");
+        proxy::new().inbound(srv).controller(dstctl.run().await).run().await
     }}
 }
 
@@ -1132,43 +1305,75 @@ mod proxy_to_proxy {
                 self.out_proxy.join_servers(),
             };
         }
+
+        async fn mk(srv: server::Listening) -> Self {
+            let dstctl = controller::new();
+            let srv_addr = srv.addr;
+            let dst = format!("transparency.test.svc.cluster.local:{}", srv_addr.port());
+            let _profile_in =
+                dstctl.profile_tx_default(&dst, "transparency.test.svc.cluster.local");
+            let dstctl = dstctl
+                .run()
+                .instrument(tracing::info_span!("dstctl", "inbound"))
+                .await;
+            let inbound = proxy::new().controller(dstctl).inbound(srv).run().await;
+
+            let dstctl = controller::new();
+            let _profile_out =
+                dstctl.profile_tx_default(srv_addr, "transparency.test.svc.cluster.local");
+            let dst = dstctl.destination_tx(dst);
+            dst.send_h2_hinted(inbound.inbound);
+
+            let dstctl = dstctl
+                .run()
+                .instrument(tracing::info_span!("dstctl", "outbound"))
+                .await;
+            let outbound = proxy::new()
+                .controller(dstctl)
+                .outbound_ip(srv_addr)
+                .run()
+                .await;
+
+            let addr = outbound.outbound;
+            ProxyToProxy {
+                _dst: dst,
+                _profile_in,
+                _profile_out,
+                in_proxy: inbound,
+                out_proxy: outbound,
+                inbound: addr,
+            }
+        }
     }
 
-    http1_tests! { proxy: |srv: server::Listening| async move {
-        let ctrl = controller::new();
-        let srv_addr = srv.addr;
-        let dst = format!("transparency.test.svc.cluster.local:{}", srv_addr.port());
-        let _profile_in = ctrl.profile_tx_default(&dst, "transparency.test.svc.cluster.local");
-        let ctrl = ctrl
-            .run()
-            .instrument(tracing::info_span!("ctrl", "inbound"))
+    http1_tests! { proxy: ProxyToProxy::mk }
+
+    /// Reproduces https://github.com/linkerd/linkerd2/issues/10090 --- an error
+    /// is logged by the inbound proxy's Hyper server due to the presence of a
+    /// `connection: close` header on the HTTP response, which is invalid in HTTP/2.
+    ///
+    /// Unfortunately, this test cannot actually *panic* when this error is
+    /// logged, but the test still exercises the behavior.
+    #[tokio::test]
+    async fn http1_inbound_timeout() {
+        let _trace = trace_init();
+
+        // server will always time out
+        let srv = server::http1()
+            .delay_listen(futures::future::pending())
             .await;
-        let inbound = proxy::new().controller(ctrl).inbound(srv).run().await;
+        let proxies = ProxyToProxy::mk(srv).await;
+        let client = client::http1(
+            proxies.out_proxy.outbound,
+            "transparency.test.svc.cluster.local",
+        );
+        let res = client.request(client.request_builder("/")).await.unwrap();
+        // tracing::info!(res);
+        assert_eq!(res.status(), http::StatusCode::BAD_GATEWAY);
 
-        let ctrl = controller::new();
-        let _profile_out = ctrl.profile_tx_default(srv_addr, "transparency.test.svc.cluster.local");
-        let dst = ctrl.destination_tx(dst);
-        dst.send_h2_hinted(inbound.inbound);
-
-        let ctrl = ctrl
-            .run()
-            .instrument(tracing::info_span!("ctrl", "outbound"))
-            .await;
-        let outbound = proxy::new()
-            .controller(ctrl)
-            .outbound_ip(srv_addr)
-            .run().await;
-
-        let addr = outbound.outbound;
-        ProxyToProxy {
-            _dst: dst,
-            _profile_in,
-            _profile_out,
-            in_proxy: inbound,
-            out_proxy: outbound,
-            inbound: addr,
-        }
-    } }
+        // ensure panics from the server are propagated
+        proxies.join_servers().await;
+    }
 }
 
 #[tokio::test]
@@ -1360,7 +1565,8 @@ async fn retry_reconnect_errors() {
     metrics::metric("tcp_open_total")
         .label("peer", "src")
         .label("direction", "inbound")
-        .label("srv_name", "default:all-unauthenticated")
+        .label("srv_kind", "default")
+        .label("srv_name", "all-unauthenticated")
         .value(1u64)
         .assert_in(&metrics)
         .await;
@@ -1454,13 +1660,19 @@ async fn http1_orig_proto_does_not_propagate_rst_stream() {
         })
         .run()
         .await;
-    let ctrl = controller::new();
     let host = "transparency.test.svc.cluster.local";
-    let _profile = ctrl.profile_tx_default(srv.addr, host);
-    let dst = ctrl.destination_tx(format!("{}:{}", host, srv.addr.port()));
+    let authority = format!("transparency.test.svc.cluster.local:{}", srv.addr.port());
+
+    let dstctl = controller::new();
+    let _profile = dstctl.profile_tx_default(srv.addr, host);
+    let dst = dstctl.destination_tx(&authority);
     dst.send_h2_hinted(srv.addr);
+
+    let polctl = controller::policy().outbound_default(srv.addr, &authority);
+
     let proxy = proxy::new()
-        .controller(ctrl.run().await)
+        .controller(dstctl.run().await)
+        .policy(polctl.run().await)
         .outbound(srv)
         .run()
         .await;

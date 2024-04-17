@@ -1,45 +1,58 @@
-name: coverage
+name: Coverage
+
+on:
+  push:
+    branches: [main]
+  pull_request: {}
 
 permissions:
   contents: read
 
-on:
-  pull_request:
-    paths:
-      - .github/workflows/coverage.yml
-  schedule:
-    # Run daily at 11AM UTC (3AM PST).
-    - cron: '0 11 * * *'
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref }}
+  cancel-in-progress: true
 
 env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
-  CARGO_TARPAULIN_VERSION: 0.18.5
-  DEBIAN_FRONTEND: noninteractive
-  RUST_BACKTRACE: short
+  RUSTFLAGS: "-D warnings -A deprecated -C debuginfo=2"
   RUSTUP_MAX_RETRIES: 10
 
 jobs:
-  test:
-    name: codecov
+  meta:
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633
+      - id: changed
+        uses: tj-actions/changed-files@2d756ea4c53f7f6b397767d8723b3a10a9f35bf2
+        with:
+          files: |
+            .codecov.yml
+            .github/workflows/coverage.yml
+            **/*.rs
+          files_ignore: |
+            *-proto/**
+            linkerd/transport-header/**
+    outputs:
+      any_changed: ${{ steps.changed.outputs.any_changed }}
+
+  codecov:
+    needs: meta
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || needs.meta.outputs.any_changed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     container:
-      image: docker://rust:1.59.0-buster
+      image: docker://ghcr.io/linkerd/dev:v43-rust
       options: --security-opt seccomp=unconfined # 🤷
+    env:
+      CXX: "/usr/bin/clang++-14"
     steps:
-      - run: apt update && apt install -y cmake clang golang # for boring
-      - uses: actions/checkout@a12a3943b4bdde767164f792f33f40b04645d846
-      - name: install cargo-tarpaulin ${{ env.CARGO_TARPAULIN_VERSION }}
-        run: |
-          cd "${CARGO_HOME}/bin"
-          curl -sL https://github.com/xd009642/tarpaulin/releases/download/${CARGO_TARPAULIN_VERSION}/cargo-tarpaulin-${CARGO_TARPAULIN_VERSION}-travis.tar.gz | tar xzvf -
-      # XXX(ver) AFAICT, Tarpaulin doesn't allow us to compose a report over multiple invocations,
-      # so we have to choose between getting coverage from unit tests and integration tests (since
-      # integration tests require --no-default-features to avoid flakiness). Currently the
-      # integration tests seem to cover more code, so we skip the unit tests for now :(.
-      #- run: cargo tarpaulin --locked --workspace --exclude=linkerd2-proxy --exclude=linkerd-app-integration --no-run
-      #- run: cargo tarpaulin --locked --workspace --exclude=linkerd2-proxy --exclude=linkerd-app-integration --skip-clean --ignore-tests --no-fail-fast --out=Xml
-      - run: cargo tarpaulin --locked --packages=linkerd-app-integration --no-default-features --skip-clean --no-run
-      - run: cargo tarpaulin --locked --packages=linkerd-app-integration --no-default-features --skip-clean --ignore-tests --no-fail-fast --out=Xml
-      - uses: codecov/codecov-action@f32b3a3741e1053eb607407145bc9619351dc93b
+      - uses: actions/checkout@9bb56186c3b09b4f86b1c65136769dd318469633
+      - uses: Swatinem/rust-cache@23bce251a8cd2ffc3c1075eaa2367cf899916d84
+      - run: cargo tarpaulin --locked --workspace --exclude=linkerd2-proxy --exclude=linkerd-transport-header --exclude=opencensus-proto --exclude=spire-proto --no-run
+      - run: cargo tarpaulin --locked --workspace --exclude=linkerd2-proxy --exclude=linkerd-transport-header --exclude=opencensus-proto --exclude=spire-proto --skip-clean --ignore-tests --no-fail-fast --out=Xml
+        # Some tests are especially flakey in coverage tests. That's fine. We
+        # only really care to measure how much of our codebase is covered.
+        continue-on-error: true
+      - uses: codecov/codecov-action@84508663e988701840491b86de86b666e8a86bed

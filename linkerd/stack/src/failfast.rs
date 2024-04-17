@@ -1,93 +1,113 @@
 //! A middleware that limits the amount of time the service may be not ready
 //! before requests are failed.
 
-use crate::layer;
-use futures::TryFuture;
+#[cfg(test)]
+mod test;
+
+use crate::{gate, layer};
+use futures::{FutureExt, TryFuture};
 use linkerd_error::Error;
 use pin_project::pin_project;
 use std::{
     future::Future,
+    mem,
     pin::Pin,
     task::{Context, Poll},
 };
 use thiserror::Error;
-use tokio::time::{self, Duration, Instant, Sleep};
+use tokio::{
+    task,
+    time::{self, Duration, Instant, Sleep},
+};
+use tower::ServiceExt;
 use tracing::{debug, info, trace, warn};
 
+/// A middleware that limits the amount of time the service may be not ready.
+///
+/// When the inner service's `poll_ready` method returns [`Poll::Pending`], this
+/// middleware starts a failfast timeout. During this timeout, subsequent
+/// `poll_ready` calls poll the inner service directly, and if the inner service
+/// becomes ready before the timeout elapses, the timeout is canceled. However,
+/// if the timeout elapses before the inner service becomes ready, this
+/// middleware will enter a failfast state, where it will return `Poll::Ready`
+/// immediately, and handle all requests by failing them immediately.
+///
+/// When this middleware is in the failfast state, the inner service is polled on a
+/// background task until it becomes ready again, at which point, this
+/// middleware will exit the failfast state.
 #[derive(Debug)]
 pub struct FailFast<S> {
-    scope: &'static str,
-    inner: S,
-    max_unavailable: Duration,
+    timeout: Duration,
     wait: Pin<Box<Sleep>>,
-    state: State,
+    state: State<S>,
+    gate: Option<gate::Tx>,
 }
 
 /// An error representing that an operation timed out.
-#[derive(Debug, Error)]
-#[error("{} service in fail-fast", self.scope)]
-pub struct FailFastError {
-    scope: &'static str,
-}
+#[derive(Debug, Default, Error)]
+#[error("service in fail-fast")]
+pub struct FailFastError(());
 
 #[derive(Debug)]
-enum State {
-    Open,
-    Waiting,
-    FailFast,
+enum State<S> {
+    Open(S),
+    Waiting(S),
+    FailFast(task::JoinHandle<Result<S, (S, Error)>>),
+    /// Empty state used only for transitions.
+    Invalid,
 }
 
 #[pin_project(project = ResponseFutureProj)]
 pub enum ResponseFuture<F> {
     Inner(#[pin] F),
-    FailFast(&'static str),
+    FailFast,
 }
 
 // === impl FailFast ===
 
 impl<S> FailFast<S> {
-    pub fn layer(
-        scope: &'static str,
-        max_unavailable: Duration,
-    ) -> impl layer::Layer<S, Service = Self> + Clone + Copy {
-        layer::mk(move |inner| Self {
-            scope,
-            inner,
-            max_unavailable,
+    /// Returns a layer for producing a `FailFast` without a paired [`gate::Gate`].
+    pub fn layer(timeout: Duration) -> impl layer::Layer<S, Service = Self> + Clone {
+        layer::mk(move |inner| Self::new(timeout, None, inner))
+    }
+
+    /// Returns a layer for producing a `FailFast` pair wrapping an inner
+    /// layer's service.
+    ///
+    /// When the service is in fail-fast, the inner layer's service will see the
+    /// fail-fast errors produced by _its_ inner service. However, the outer
+    /// failfast service, which wraps the inner layer's service, will return
+    /// `Poll::Pending` while the innermost service is unavailable.
+    pub fn layer_gated<L>(
+        timeout: Duration,
+        inner_layer: L,
+    ) -> impl layer::Layer<S, Service = gate::Gate<L::Service>> + Clone
+    where
+        L: layer::Layer<Self> + Clone,
+    {
+        layer::mk(move |inner| {
+            let (tx, rx) = gate::channel();
+            let inner = inner_layer.layer(Self::new(timeout, Some(tx), inner));
+            gate::Gate::new(rx, inner)
+        })
+    }
+
+    fn new(timeout: Duration, gate: Option<gate::Tx>, inner: S) -> Self {
+        Self {
+            timeout,
             // The sleep is reset whenever the service becomes unavailable; this
             // initial one will never actually be used, so it's okay to start it
             // now.
             wait: Box::pin(time::sleep(Duration::default())),
-            state: State::Open,
-        })
-    }
-}
-
-impl<S> Clone for FailFast<S>
-where
-    S: Clone,
-{
-    fn clone(&self) -> Self {
-        // When cloning failfast, we can't preserve the waiting state, so each
-        // clone will have to detect its own failfast. Practically, this means
-        // that each connection will have to wait for a timeout before
-        // triggering failfast.
-        Self {
-            scope: self.scope,
-            inner: self.inner.clone(),
-            max_unavailable: self.max_unavailable,
-
-            // Reset the state and sleep; each clone of the underlying services
-            // may become ready independently (e.g. semaphore).
-            wait: Box::pin(time::sleep(Duration::default())),
-            state: State::Open,
+            state: State::Open(inner),
+            gate,
         }
     }
 }
 
 impl<S, T> tower::Service<T> for FailFast<S>
 where
-    S: tower::Service<T>,
+    S: tower::Service<T> + Send + 'static,
     S::Error: Into<Error>,
 {
     type Response = S::Response;
@@ -95,63 +115,138 @@ where
     type Future = ResponseFuture<S::Future>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        match self.inner.poll_ready(cx) {
-            // If the inner service is not ready, go into failfast after `max_unavailable`.
-            Poll::Pending => loop {
-                self.state = match self.state {
-                    // The inner service just transitioned to NotReady, so initiate a new timeout.
-                    State::Open => {
-                        self.wait
-                            .as_mut()
-                            .reset(Instant::now() + self.max_unavailable);
-                        debug!("{} service has become unavailable", self.scope);
-                        State::Waiting
+        loop {
+            match mem::replace(&mut self.state, State::Invalid) {
+                // ## Open => (Open | Waiting)
+                //
+                // Initially, poll the inner service. If it is pending,
+                // transition to the waiting state.
+                State::Open(mut inner) => match inner.poll_ready(cx) {
+                    // The inner service just transitioned to `Pending`, so initiate a new timeout.
+                    Poll::Pending => {
+                        self.wait.as_mut().reset(Instant::now() + self.timeout);
+                        debug!("Service has become unavailable");
+                        self.state = State::Waiting(inner)
                     }
+                    Poll::Ready(res) => {
+                        self.state = State::Open(inner);
+                        return Poll::Ready(res.map_err(Into::into));
+                    }
+                },
 
-                    // A timeout has been set, so wait for it to complete.
-                    State::Waiting => {
+                // ## Waiting => (Waiting | Open | FailFast)
+                //
+                // While waiting, poll the inner service directly. If it
+                // continues to be pending past the timeout, transition to the
+                // FailFast state.
+                //
+                // When entering the FailFast state, we advertise this state
+                // change to paired `Gate` instances (so that they may begin
+                // refusing new requests) and spawn a background task that
+                // drives the inner service to become ready. When the inner
+                // service becomes ready, the background task notifies the
+                // `Gate`s so that they admit more requests. That should allow
+                // this poll_ready to be called again to advance the state to
+                // open.
+                State::Waiting(mut inner) => match inner.poll_ready(cx) {
+                    // The inner service became ready, transition back to `Open`.
+                    Poll::Ready(res) => {
+                        trace!("Service has become ready");
+                        self.state = State::Open(inner);
+                        return Poll::Ready(res.map_err(Into::into));
+                    }
+                    // The inner service hasn't become ready yet --- has the
+                    // timeout elapsed?
+                    Poll::Pending => {
                         let poll = self.wait.as_mut().poll(cx);
+
                         if poll.is_pending() {
-                            trace!("Pending");
+                            // The timeout hasn't elapsed yet, keep waiting.
+                            trace!("Service is Pending");
+                            self.state = State::Waiting(inner);
                             return Poll::Pending;
                         }
-                        warn!(
-                            "{} entering failfast after {:?}",
-                            self.scope, self.max_unavailable
-                        );
-                        State::FailFast
-                    }
 
-                    // Admit requests and fail them immediately.
-                    State::FailFast => {
-                        debug!("{} in failfast", self.scope);
+                        warn!("Service entering failfast after {:?}", self.timeout);
+                        if let Some(gate) = self.gate.as_ref() {
+                            let _ = gate.shut();
+                        }
+
+                        let gate = self.gate.clone();
+                        self.state = State::FailFast(task::spawn(async move {
+                            let res = inner.ready().await;
+                            // Notify the paired `Gate` instances to begin
+                            // advertising readiness so that the failfast
+                            // service can advance.
+                            if let Some(gate) = gate {
+                                let _ = gate.open();
+                            }
+                            match res {
+                                Ok(_) => {
+                                    info!("Service has recovered");
+                                    Ok(inner)
+                                }
+                                Err(error) => {
+                                    let error = error.into();
+                                    warn!(%error, "Service failed to recover");
+                                    Err((inner, error))
+                                }
+                            }
+                        }));
+                    }
+                },
+
+                // ## FailFast => (FailFast | Open)
+                //
+                // While in the FailFast state, first check if the background
+                // task has completed with a result. If so, transition back to
+                // `Open`. Otherwise, continue to advertise readiness so that we
+                // may fail requests.
+                State::FailFast(mut task) => {
+                    if let Poll::Ready(res) = task.poll_unpin(cx) {
+                        // The service became ready in the background, exit failfast.
+                        let (svc, res) = match res {
+                            Err(joinerr) => panic!("failfast background task panicked: {joinerr}"),
+                            Ok(Err((svc, error))) => (svc, Poll::Ready(Err(error))),
+                            Ok(Ok(svc)) => (svc, Poll::Ready(Ok(()))),
+                        };
+                        self.state = State::Open(svc);
+                        return res;
+                    } else {
+                        // Admit requests and fail them immediately.
+                        debug!("Service in failfast");
+                        self.state = State::FailFast(task);
                         return Poll::Ready(Ok(()));
                     }
-                };
-            },
-
-            // If the inner service is ready or has failed, then let subsequent
-            // calls through to the service.
-            ret => {
-                match self.state {
-                    State::Open => {}
-                    State::Waiting => trace!("{} has become ready", self.scope),
-                    State::FailFast => info!("{} service has recovered", self.scope),
                 }
-                self.state = State::Open;
-                ret.map_err(Into::into)
+
+                State::Invalid => unreachable!("state should always be put back, this is a bug!"),
             }
         }
     }
 
     fn call(&mut self, req: T) -> Self::Future {
         match self.state {
-            State::Open => ResponseFuture::Inner(self.inner.call(req)),
-            State::FailFast => ResponseFuture::FailFast(self.scope),
-            State::Waiting => panic!("poll_ready must be called"),
+            State::Open(ref mut inner) => ResponseFuture::Inner(inner.call(req)),
+            State::FailFast(_) => ResponseFuture::FailFast,
+            State::Waiting(_) => panic!("poll_ready must be called"),
+            State::Invalid => unreachable!("state should always be put back, this is a bug!"),
         }
     }
 }
+
+impl<S> Drop for FailFast<S> {
+    /// When dropping a `FailFast` layer, which may own a spawned background
+    /// task, ensure that the background task is canceled to avoid leaking it
+    /// onto the runtime.
+    fn drop(&mut self) {
+        if let State::FailFast(ref task) = self.state {
+            task.abort();
+        }
+    }
+}
+
+// === impl ResponseFuture ===
 
 impl<F> Future for ResponseFuture<F>
 where
@@ -163,46 +258,7 @@ where
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.project() {
             ResponseFutureProj::Inner(f) => f.try_poll(cx).map_err(Into::into),
-            ResponseFutureProj::FailFast(scope) => Poll::Ready(Err(FailFastError { scope }.into())),
+            ResponseFutureProj::FailFast => Poll::Ready(Err(FailFastError(()).into())),
         }
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::FailFast;
-    use std::time::Duration;
-    use tokio_test::{assert_pending, assert_ready, assert_ready_ok};
-    use tower::layer::Layer;
-    use tower_test::mock::{self, Spawn};
-
-    #[tokio::test]
-    async fn fails_fast() {
-        let max_unavailable = Duration::from_millis(100);
-        let (service, mut handle) = mock::pair::<(), ()>();
-        let mut service = Spawn::new(FailFast::layer("Test", max_unavailable).layer(service));
-
-        // The inner starts unavailable.
-        handle.allow(0);
-        assert_pending!(service.poll_ready());
-
-        // Then we wait for the idle timeout, at which point the service
-        // should start failing fast.
-        tokio::time::sleep(max_unavailable + Duration::from_millis(1)).await;
-        assert_ready_ok!(service.poll_ready());
-
-        let err = service.call(()).await.err().expect("should failfast");
-        assert!(err.is::<super::FailFastError>());
-
-        // Then the inner service becomes available.
-        handle.allow(1);
-        assert_ready_ok!(service.poll_ready());
-        let fut = service.call(());
-
-        let ((), rsp) = handle.next_request().await.expect("must get a request");
-        rsp.send_response(());
-
-        let ret = fut.await;
-        assert!(ret.is_ok());
     }
 }

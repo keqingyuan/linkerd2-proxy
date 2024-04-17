@@ -1,20 +1,11 @@
+use super::app_core::svc::http::TracingExecutor;
 use super::*;
-use futures::TryFuture;
-use http::Response;
-use linkerd_app_core::proxy::http::trace;
-use std::collections::HashMap;
-use std::future::Future;
-use std::io;
-use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
-use std::task::{Context, Poll};
-use tokio::net::TcpStream;
-use tokio::sync::oneshot;
-use tokio::task::JoinHandle;
-use tokio_rustls::rustls::ServerConfig;
-use tokio_rustls::TlsAcceptor;
-use tracing::instrument::Instrument;
+use std::{
+    io,
+    sync::atomic::{AtomicUsize, Ordering},
+};
+use tokio::{net::TcpStream, task::JoinHandle};
+use tokio_rustls::{rustls::ServerConfig, TlsAcceptor};
 
 pub fn new() -> Server {
     http2()
@@ -51,22 +42,24 @@ pub struct Listening {
     pub(super) drain: drain::Signal,
     pub(super) conn_count: Arc<AtomicUsize>,
     pub(super) task: Option<JoinHandle<Result<(), io::Error>>>,
+    pub(super) http_version: Option<Run>,
 }
 
-pub fn mock_listening(a: SocketAddr) -> Listening {
-    let (tx, _rx) = drain::channel();
-    let conn_count = Arc::new(AtomicUsize::from(0));
-    Listening {
-        addr: a,
-        drain: tx,
-        conn_count,
-        task: Some(tokio::spawn(async { Ok(()) })),
-    }
-}
+type Request = http::Request<hyper::Body>;
+type Response = http::Response<hyper::Body>;
+type RspFuture = Pin<Box<dyn Future<Output = Result<Response, BoxError>> + Send + Sync + 'static>>;
 
 impl Listening {
     pub fn connections(&self) -> usize {
         self.conn_count.load(Ordering::Acquire)
+    }
+
+    pub fn http_client(&self, auth: impl Into<String>) -> client::Client {
+        match self.http_version.as_ref() {
+            Some(Run::Http1) => client::http1(self.addr, auth),
+            Some(Run::Http2) => client::http2(self.addr, auth),
+            None => panic!("unknown HTTP version, server is configured for raw TCP"),
+        }
     }
 
     /// Wait for the server task to join, and propagate panics.
@@ -133,7 +126,7 @@ impl Server {
     /// to send back.
     pub fn route_fn<F>(self, path: &str, cb: F) -> Self
     where
-        F: Fn(Request<hyper::Body>) -> Response<Bytes> + Send + Sync + 'static,
+        F: Fn(Request) -> Response + Send + Sync + 'static,
     {
         self.route_async(path, move |req| {
             let res = cb(req);
@@ -145,21 +138,11 @@ impl Server {
     /// a response to send back.
     pub fn route_async<F, U>(mut self, path: &str, cb: F) -> Self
     where
-        F: Fn(Request<hyper::Body>) -> U + Send + Sync + 'static,
-        U: TryFuture<Ok = Response<Bytes>> + Send + Sync + 'static,
+        F: Fn(Request) -> U + Send + Sync + 'static,
+        U: TryFuture<Ok = Response> + Send + Sync + 'static,
         U::Error: Into<BoxError> + Send + 'static,
     {
-        let func = move |req| {
-            Box::pin(cb(req).map_err(Into::into))
-                as Pin<
-                    Box<
-                        dyn Future<Output = Result<Response<Bytes>, BoxError>>
-                            + Send
-                            + Sync
-                            + 'static,
-                    >,
-                >
-        };
+        let func = move |req| Box::pin(cb(req).map_err(Into::into)) as RspFuture;
         self.routes.insert(path.into(), Route(Box::new(func)));
         self
     }
@@ -173,7 +156,7 @@ impl Server {
                 Ok::<_, BoxError>(
                     http::Response::builder()
                         .status(200)
-                        .body(resp.clone())
+                        .body(hyper::Body::from(resp.clone()))
                         .unwrap(),
                 )
             }
@@ -211,8 +194,7 @@ impl Server {
             async move {
                 tracing::info!("support server running");
                 let mut new_svc = NewSvc(Arc::new(self.routes));
-                let mut http =
-                    hyper::server::conn::Http::new().with_executor(trace::Executor::new());
+                let mut http = hyper::server::conn::Http::new().with_executor(TracingExecutor);
                 match self.version {
                     Run::Http1 => http.http1_only(true),
                     Run::Http2 => http.http2_only(true),
@@ -231,7 +213,7 @@ impl Server {
                 tracing::info!("listening!");
                 loop {
                     let (sock, addr) = listener.accept().await?;
-                    let span = tracing::debug_span!("conn", %addr);
+                    let span = tracing::debug_span!("conn", %addr).or_current();
                     let sock = accept_connection(sock, tls_config.clone())
                         .instrument(span.clone())
                         .await?;
@@ -273,20 +255,18 @@ impl Server {
             drain: drain_signal,
             conn_count,
             task: Some(task),
+            http_version: Some(version),
         }
     }
 }
 
 #[derive(Clone, Copy, Debug)]
-enum Run {
+pub(super) enum Run {
     Http1,
     Http2,
 }
 
-struct Route(Box<dyn Fn(Request<hyper::Body>) -> RspFuture + Send + Sync>);
-
-type RspFuture =
-    Pin<Box<dyn Future<Output = Result<http::Response<Bytes>, BoxError>> + Send + Sync + 'static>>;
+struct Route(Box<dyn Fn(Request) -> RspFuture + Send + Sync>);
 
 impl Route {
     fn string(body: &str) -> Route {
@@ -295,7 +275,7 @@ impl Route {
             Box::pin(future::ok(
                 http::Response::builder()
                     .status(200)
-                    .body(body.clone())
+                    .body(hyper::Body::from(body.clone()))
                     .unwrap(),
             ))
         }))
@@ -314,11 +294,7 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 struct Svc(Arc<HashMap<String, Route>>);
 
 impl Svc {
-    fn route(
-        &mut self,
-        req: Request<hyper::Body>,
-    ) -> Pin<Box<dyn Future<Output = Result<Response<Bytes>, BoxError>> + Send + Sync + 'static>>
-    {
+    fn route(&mut self, req: Request) -> RspFuture {
         match self.0.get(req.uri().path()) {
             Some(Route(ref func)) => {
                 tracing::trace!(path = %req.uri().path(), "found route for path");
@@ -336,20 +312,17 @@ impl Svc {
     }
 }
 
-type SvcFuture =
-    Pin<Box<dyn Future<Output = Result<Response<hyper::Body>, BoxError>> + Send + 'static>>;
-
-impl tower::Service<Request<hyper::Body>> for Svc {
-    type Response = Response<hyper::Body>;
+impl tower::Service<Request> for Svc {
+    type Response = Response;
     type Error = BoxError;
-    type Future = SvcFuture;
+    type Future = RspFuture;
 
     fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         Poll::Ready(Ok(()))
     }
 
-    fn call(&mut self, req: hyper::Request<hyper::Body>) -> Self::Future {
-        Box::pin(self.route(req).map_ok(|res| res.map(hyper::Body::from)))
+    fn call(&mut self, req: Request) -> Self::Future {
+        self.route(req)
     }
 }
 

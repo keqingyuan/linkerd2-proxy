@@ -1,17 +1,14 @@
 use super::*;
 
-use linkerd2_proxy_api::destination as pb;
+pub use linkerd2_proxy_api::destination as pb;
 use linkerd2_proxy_api::net;
-use linkerd_app_core::proxy::http::trace;
+use linkerd_app_core::proxy::http::TracingExecutor;
 use parking_lot::Mutex;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::net::IpAddr;
 use std::ops::{Bound, RangeBounds};
-use std::sync::Arc;
-use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tonic as grpc;
-use tracing::instrument::Instrument;
 
 pub fn new() -> Controller {
     Controller::new()
@@ -23,6 +20,10 @@ pub fn new_unordered() -> Controller {
 
 pub fn identity() -> identity::Controller {
     identity::Controller::default()
+}
+
+pub fn policy() -> policy::Controller {
+    policy::Controller::default()
 }
 
 pub type Labels = HashMap<String, String>;
@@ -129,7 +130,7 @@ impl Controller {
     }
 
     pub fn profile_tx_default(&self, target: impl ToString, dest: &str) -> ProfileSender {
-        let tx = self.profile_tx(&target.to_string());
+        let tx = self.profile_tx(target.to_string());
         tx.send(pb::DestinationProfile {
             fully_qualified_name: dest.to_owned(),
             ..Default::default()
@@ -137,10 +138,10 @@ impl Controller {
         tx
     }
 
-    pub fn profile_tx(&self, dest: impl Into<String>) -> ProfileSender {
+    pub fn profile_tx(&self, dest: impl ToString) -> ProfileSender {
         let (tx, rx) = mpsc::unbounded_channel();
         let rx = UnboundedReceiverStream::new(rx);
-        let mut path = dest.into();
+        let mut path = dest.to_string();
         if !path.contains(':') {
             path.push_str(":80");
         };
@@ -177,41 +178,39 @@ fn grpc_unexpected_request() -> grpc::Status {
 }
 
 impl DstSender {
-    pub fn send(&self, up: pb::Update) {
-        self.0.send(Ok(up)).expect("send dst update")
+    #[track_caller]
+    pub fn send(&self, up: impl Into<pb::Update>) {
+        self.0.send(Ok(up.into())).expect("send dst update")
     }
 
+    #[track_caller]
     pub fn send_err(&self, e: grpc::Status) {
         self.0.send(Err(e)).expect("send dst err")
     }
 
+    #[track_caller]
     pub fn send_addr(&self, addr: SocketAddr) {
         self.send(destination_add(addr))
     }
 
-    pub fn send_labeled(&self, addr: SocketAddr, addr_labels: Labels, parent_labels: Labels) {
-        self.send(destination_add_labeled(
-            addr,
-            Hint::Unknown,
-            addr_labels,
-            parent_labels,
-        ));
-    }
-
+    #[track_caller]
     pub fn send_h2_hinted(&self, addr: SocketAddr) {
-        self.send(destination_add_hinted(addr, Hint::H2));
+        self.send(destination_add(addr).hint(Hint::H2));
     }
 
+    #[track_caller]
     pub fn send_no_endpoints(&self) {
         self.send(destination_exists_with_no_endpoints())
     }
 }
 
 impl ProfileSender {
+    #[track_caller]
     pub fn send(&self, up: pb::DestinationProfile) {
         self.0.send(Ok(up)).expect("send profile update")
     }
 
+    #[track_caller]
     pub fn send_err(&self, err: grpc::Status) {
         self.0.send(Err(err)).expect("send profile update")
     }
@@ -338,14 +337,14 @@ impl Listening {
     }
 }
 
-pub(in crate) async fn run<T, B>(
+pub(crate) async fn run<T, B>(
     svc: T,
     name: &'static str,
     delay: Option<Pin<Box<dyn Future<Output = ()> + Send>>>,
 ) -> Listening
 where
     T: tower::Service<http::Request<hyper::body::Body>, Response = http::Response<B>>,
-    T: Clone + Send + Sync + 'static,
+    T: Clone + Send + 'static,
     T::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     T::Future: Send,
     B: http_body::Body + Send + 'static,
@@ -373,16 +372,19 @@ where
                 let _ = listening_tx.send(());
             }
 
-            let mut http = hyper::server::conn::Http::new().with_executor(trace::Executor::new());
+            let mut http = hyper::server::conn::Http::new().with_executor(TracingExecutor);
             http.http2_only(true);
             loop {
                 let (sock, addr) = listener.accept().await?;
-                let span = tracing::debug_span!("conn", %addr);
+                let span = tracing::debug_span!("conn", %addr).or_current();
                 let serve = http.serve_connection(sock, svc.clone());
                 let f = async move {
-                    serve
-                        .await
-                        .map_err(|error| tracing::error!(%error, "serving connection failed."))?;
+                    serve.await.map_err(|error| {
+                        tracing::error!(
+                            error = &error as &dyn std::error::Error,
+                            "serving connection failed."
+                        )
+                    })?;
                     Ok::<(), ()>(())
                 };
                 tokio::spawn(cancelable(drain.clone(), f).instrument(span.or_current()));
@@ -405,66 +407,137 @@ where
 pub enum Hint {
     Unknown,
     H2,
+    Opaque,
 }
 
-pub fn destination_add(addr: SocketAddr) -> pb::Update {
-    destination_add_hinted(addr, Hint::Unknown)
-}
-
-pub fn destination_add_hinted(addr: SocketAddr, hint: Hint) -> pb::Update {
-    destination_add_labeled(addr, hint, HashMap::new(), HashMap::new())
-}
-
-pub fn destination_add_labeled(
+pub struct DestinationBuilder {
     addr: SocketAddr,
     hint: Hint,
+    opaque_port: Option<u16>,
     set_labels: HashMap<String, String>,
     addr_labels: HashMap<String, String>,
-) -> pb::Update {
-    let protocol_hint = match hint {
-        Hint::Unknown => None,
-        Hint::H2 => Some(pb::ProtocolHint {
-            protocol: Some(pb::protocol_hint::Protocol::H2(pb::protocol_hint::H2 {})),
-            ..Default::default()
-        }),
-    };
-    pb::Update {
-        update: Some(pb::update::Update::Add(pb::WeightedAddrSet {
-            addrs: vec![pb::WeightedAddr {
-                addr: Some(net::TcpAddress {
-                    ip: Some(ip_conv(addr.ip())),
-                    port: u32::from(addr.port()),
-                }),
-                weight: 0,
-                metric_labels: addr_labels,
-                protocol_hint,
-                ..Default::default()
-            }],
-            metric_labels: set_labels,
-        })),
+    identity: Option<String>,
+}
+
+impl DestinationBuilder {
+    pub fn new(addr: SocketAddr) -> Self {
+        Self {
+            addr,
+            hint: Hint::Unknown,
+            opaque_port: None,
+            set_labels: Default::default(),
+            addr_labels: Default::default(),
+            identity: None,
+        }
+    }
+
+    pub fn hint(self, hint: Hint) -> Self {
+        Self { hint, ..self }
+    }
+
+    pub fn opaque_port(self, port: impl Into<Option<u16>>) -> Self {
+        let opaque_port = port.into();
+        Self {
+            opaque_port,
+            ..self
+        }
+    }
+
+    pub fn identity(self, identity: impl ToString) -> Self {
+        Self {
+            identity: Some(identity.to_string()),
+            ..self
+        }
+    }
+
+    pub fn set_labels(mut self, labels: impl IntoIterator<Item = (String, String)>) -> Self {
+        self.set_labels.extend(labels);
+        self
+    }
+
+    pub fn addr_labels(mut self, labels: impl IntoIterator<Item = (String, String)>) -> Self {
+        self.addr_labels.extend(labels);
+        self
+    }
+
+    pub fn set_label(mut self, label: impl ToString, value: impl ToString) -> Self {
+        self.set_labels.insert(label.to_string(), value.to_string());
+        self
+    }
+
+    pub fn addr_label(mut self, label: impl ToString, value: impl ToString) -> Self {
+        self.addr_labels
+            .insert(label.to_string(), value.to_string());
+        self
     }
 }
 
-pub fn destination_add_tls(addr: SocketAddr, local_id: &str) -> pb::Update {
-    pb::Update {
-        update: Some(pb::update::Update::Add(pb::WeightedAddrSet {
-            addrs: vec![pb::WeightedAddr {
-                addr: Some(net::TcpAddress {
-                    ip: Some(ip_conv(addr.ip())),
-                    port: u32::from(addr.port()),
+impl From<DestinationBuilder> for pb::Update {
+    fn from(
+        DestinationBuilder {
+            addr,
+            hint,
+            opaque_port,
+            set_labels,
+            addr_labels,
+            identity,
+        }: DestinationBuilder,
+    ) -> pb::Update {
+        let protocol_hint = match (hint, opaque_port) {
+            (Hint::Unknown, None) => None,
+            (Hint::Unknown, Some(port)) => Some(pb::ProtocolHint {
+                protocol: None,
+                opaque_transport: Some(pb::protocol_hint::OpaqueTransport {
+                    inbound_port: port as u32,
                 }),
-                tls_identity: Some(pb::TlsIdentity {
-                    strategy: Some(pb::tls_identity::Strategy::DnsLikeIdentity(
-                        pb::tls_identity::DnsLikeIdentity {
-                            name: local_id.into(),
-                        },
+            }),
+            (hint, port) => {
+                let protocol = match hint {
+                    Hint::Unknown => None,
+                    Hint::H2 => Some(pb::protocol_hint::Protocol::H2(pb::protocol_hint::H2 {})),
+                    Hint::Opaque => Some(pb::protocol_hint::Protocol::Opaque(
+                        pb::protocol_hint::Opaque {},
                     )),
-                }),
-                ..Default::default()
-            }],
-            ..Default::default()
-        })),
+                };
+                let opaque_transport = port.map(|port| pb::protocol_hint::OpaqueTransport {
+                    inbound_port: port as u32,
+                });
+
+                Some(pb::ProtocolHint {
+                    protocol,
+                    opaque_transport,
+                })
+            }
+        };
+
+        let tls_identity = identity.map(|name| pb::TlsIdentity {
+            strategy: Some(pb::tls_identity::Strategy::DnsLikeIdentity(
+                pb::tls_identity::DnsLikeIdentity { name: name.clone() },
+            )),
+            server_name: Some(pb::tls_identity::DnsLikeIdentity { name }),
+        });
+
+        pb::Update {
+            update: Some(pb::update::Update::Add(pb::WeightedAddrSet {
+                addrs: vec![pb::WeightedAddr {
+                    addr: Some(net::TcpAddress {
+                        ip: Some(ip_conv(addr.ip())),
+                        port: u32::from(addr.port()),
+                    }),
+                    weight: 1,
+                    metric_labels: addr_labels,
+                    protocol_hint,
+                    tls_identity,
+                    authority_override: None,
+                }],
+                metric_labels: set_labels,
+            })),
+        }
     }
+}
+
+pub fn destination_add(addr: SocketAddr) -> DestinationBuilder {
+    DestinationBuilder::new(addr)
 }
 
 pub fn destination_add_none() -> pb::Update {
@@ -525,8 +598,11 @@ pub fn retry_budget(
     retry_ratio: f32,
     min_retries_per_second: u32,
 ) -> pb::RetryBudget {
+    let ttl = ttl
+        .try_into()
+        .expect("retry budget TTL duration cannot be converted to protobuf");
     pb::RetryBudget {
-        ttl: Some(ttl.into()),
+        ttl: Some(ttl),
         retry_ratio,
         min_retries_per_second,
     }
@@ -604,7 +680,10 @@ impl RouteBuilder {
     }
 
     pub fn timeout(mut self, dur: Duration) -> Self {
-        self.route.timeout = Some(dur.into());
+        let dur = dur
+            .try_into()
+            .expect("timeout duration cannot be converted to protobuf");
+        self.route.timeout = Some(dur);
         self
     }
 }

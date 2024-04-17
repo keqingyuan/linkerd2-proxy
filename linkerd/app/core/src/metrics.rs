@@ -1,27 +1,36 @@
+//! This module provides most of the metrics infrastructure for both inbound &
+//! outbound proxies.
+//!
+//! This is less than ideal. Instead of having common metrics with differing
+//! labels for inbound & outbound, we should instead have distinct metrics for
+//! each case. And the metric registries should be instantiated in the
+//! inbound/outbound crates, etc.
+
 pub use crate::transport::labels::{TargetAddr, TlsAccept};
 use crate::{
-    classify::{Class, SuccessOrFailure},
-    control, http_metrics, http_metrics as metrics, opencensus, profiles, stack_metrics,
+    classify::Class,
+    control, http_metrics, opencensus, profiles, stack_metrics,
     svc::Param,
-    telemetry, tls,
+    tls,
     transport::{self, labels::TlsConnect},
 };
 use linkerd_addr::Addr;
 pub use linkerd_metrics::*;
+use linkerd_proxy_server_policy as policy;
 use std::{
     fmt::{self, Write},
     net::SocketAddr,
     sync::Arc,
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 
 pub type ControlHttp = http_metrics::Requests<ControlLabels, Class>;
 
 pub type HttpEndpoint = http_metrics::Requests<EndpointLabels, Class>;
 
-pub type HttpRoute = http_metrics::Requests<RouteLabels, Class>;
+pub type HttpProfileRoute = http_metrics::Requests<ProfileRouteLabels, Class>;
 
-pub type HttpRouteRetry = http_metrics::Retries<RouteLabels>;
+pub type HttpProfileRouteRetry = http_metrics::Retries<ProfileRouteLabels>;
 
 pub type Stack = stack_metrics::Registry<StackLabels>;
 
@@ -34,9 +43,9 @@ pub struct Metrics {
 
 #[derive(Clone, Debug)]
 pub struct Proxy {
-    pub http_route: HttpRoute,
-    pub http_route_actual: HttpRoute,
-    pub http_route_retry: HttpRouteRetry,
+    pub http_profile_route: HttpProfileRoute,
+    pub http_profile_route_actual: HttpProfileRoute,
+    pub http_profile_route_retry: HttpProfileRouteRetry,
     pub http_endpoint: HttpEndpoint,
     pub transport: transport::Metrics,
     pub stack: Stack,
@@ -59,18 +68,32 @@ pub struct InboundEndpointLabels {
     pub tls: tls::ConditionalServerTls,
     pub authority: Option<http::uri::Authority>,
     pub target_addr: SocketAddr,
-    pub policy: AuthzLabels,
+    pub policy: RouteAuthzLabels,
 }
 
 /// A label referencing an inbound `Server` (i.e. for policy).
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct ServerLabel(pub Arc<str>);
+pub struct ServerLabel(pub Arc<policy::Meta>);
 
-/// Labels referencing an inbound `ServerAuthorization.
+/// Labels referencing an inbound server and authorization.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct AuthzLabels {
+pub struct ServerAuthzLabels {
     pub server: ServerLabel,
-    pub authz: Arc<str>,
+    pub authz: Arc<policy::Meta>,
+}
+
+/// Labels referencing an inbound server and route.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct RouteLabels {
+    pub server: ServerLabel,
+    pub route: Arc<policy::Meta>,
+}
+
+/// Labels referencing an inbound server, route, and authorization.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct RouteAuthzLabels {
+    pub route: RouteLabels,
+    pub authz: Arc<policy::Meta>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -89,7 +112,7 @@ pub struct StackLabels {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct RouteLabels {
+pub struct ProfileRouteLabels {
     direction: Direction,
     addr: profiles::LogicalAddr,
     labels: Option<String>,
@@ -121,36 +144,32 @@ where
 
 impl Metrics {
     pub fn new(retain_idle: Duration) -> (Self, impl FmtMetrics + Clone + Send + 'static) {
-        let process = telemetry::process::Report::new(SystemTime::now());
-
-        let build_info = telemetry::build_info::Report::new();
-
         let (control, control_report) = {
-            let m = metrics::Requests::<ControlLabels, Class>::default();
+            let m = http_metrics::Requests::<ControlLabels, Class>::default();
             let r = m.clone().into_report(retain_idle).with_prefix("control");
             (m, r)
         };
 
         let (http_endpoint, endpoint_report) = {
-            let m = metrics::Requests::<EndpointLabels, Class>::default();
+            let m = http_metrics::Requests::<EndpointLabels, Class>::default();
             let r = m.clone().into_report(retain_idle);
             (m, r)
         };
 
-        let (http_route, route_report) = {
-            let m = metrics::Requests::<RouteLabels, Class>::default();
+        let (http_profile_route, profile_route_report) = {
+            let m = http_metrics::Requests::<ProfileRouteLabels, Class>::default();
             let r = m.clone().into_report(retain_idle).with_prefix("route");
             (m, r)
         };
 
-        let (http_route_retry, retry_report) = {
-            let m = metrics::Retries::<RouteLabels>::default();
+        let (http_profile_route_retry, retry_report) = {
+            let m = http_metrics::Retries::<ProfileRouteLabels>::default();
             let r = m.clone().into_report(retain_idle).with_prefix("route");
             (m, r)
         };
 
-        let (http_route_actual, actual_report) = {
-            let m = metrics::Requests::<RouteLabels, Class>::default();
+        let (http_profile_route_actual, actual_report) = {
+            let m = http_metrics::Requests::<ProfileRouteLabels, Class>::default();
             let r = m
                 .clone()
                 .into_report(retain_idle)
@@ -164,9 +183,9 @@ impl Metrics {
 
         let proxy = Proxy {
             http_endpoint,
-            http_route,
-            http_route_retry,
-            http_route_actual,
+            http_profile_route,
+            http_profile_route_retry,
+            http_profile_route_actual,
             stack: stack.clone(),
             transport,
         };
@@ -180,15 +199,13 @@ impl Metrics {
         };
 
         let report = endpoint_report
-            .and_report(route_report)
+            .and_report(profile_route_report)
             .and_report(retry_report)
             .and_report(actual_report)
             .and_report(control_report)
             .and_report(transport_report)
             .and_report(opencensus_report)
-            .and_report(stack)
-            .and_report(process)
-            .and_report(build_info);
+            .and_report(stack);
 
         (metrics, report)
     }
@@ -214,9 +231,9 @@ impl FmtLabels for ControlLabels {
     }
 }
 
-// === impl RouteLabels ===
+// === impl ProfileRouteLabels ===
 
-impl RouteLabels {
+impl ProfileRouteLabels {
     pub fn inbound(addr: profiles::LogicalAddr, route: &profiles::http::Route) -> Self {
         let labels = prefix_labels("rt", route.labels().iter());
         Self {
@@ -236,7 +253,7 @@ impl RouteLabels {
     }
 }
 
-impl FmtLabels for RouteLabels {
+impl FmtLabels for ProfileRouteLabels {
     fn fmt_labels(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.direction.fmt_labels(f)?;
         write!(f, ",dst=\"{}\"", self.addr)?;
@@ -289,22 +306,54 @@ impl FmtLabels for InboundEndpointLabels {
     }
 }
 
-impl fmt::Display for ServerLabel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
 impl FmtLabels for ServerLabel {
     fn fmt_labels(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "srv_name=\"{}\"", self.0)
+        write!(
+            f,
+            "srv_group=\"{}\",srv_kind=\"{}\",srv_name=\"{}\"",
+            self.0.group(),
+            self.0.kind(),
+            self.0.name()
+        )
     }
 }
 
-impl FmtLabels for AuthzLabels {
+impl FmtLabels for ServerAuthzLabels {
     fn fmt_labels(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.server.fmt_labels(f)?;
-        write!(f, ",saz_name=\"{}\"", self.authz)
+        write!(
+            f,
+            ",authz_group=\"{}\",authz_kind=\"{}\",authz_name=\"{}\"",
+            self.authz.group(),
+            self.authz.kind(),
+            self.authz.name()
+        )
+    }
+}
+
+impl FmtLabels for RouteLabels {
+    fn fmt_labels(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.server.fmt_labels(f)?;
+        write!(
+            f,
+            ",route_group=\"{}\",route_kind=\"{}\",route_name=\"{}\"",
+            self.route.group(),
+            self.route.kind(),
+            self.route.name(),
+        )
+    }
+}
+
+impl FmtLabels for RouteAuthzLabels {
+    fn fmt_labels(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.route.fmt_labels(f)?;
+        write!(
+            f,
+            ",authz_group=\"{}\",authz_kind=\"{}\",authz_name=\"{}\"",
+            self.authz.group(),
+            self.authz.kind(),
+            self.authz.name(),
+        )
     }
 }
 
@@ -350,25 +399,29 @@ impl<'a> FmtLabels for Authority<'a> {
 
 impl FmtLabels for Class {
     fn fmt_labels(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Class::Default(result) => write!(f, "classification=\"{}\"", result),
-            Class::Grpc(result, status) => write!(
-                f,
-                "classification=\"{}\",grpc_status=\"{}\"",
-                result, status
-            ),
-            Class::Stream(result, status) => {
-                write!(f, "classification=\"{}\",error=\"{}\"", result, status)
-            }
-        }
-    }
-}
+        let class = |ok: bool| if ok { "success" } else { "failure" };
 
-impl fmt::Display for SuccessOrFailure {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SuccessOrFailure::Success => write!(f, "success"),
-            SuccessOrFailure::Failure => write!(f, "failure"),
+            Class::Http(res) => write!(
+                f,
+                "classification=\"{}\",grpc_status=\"\",error=\"\"",
+                class(res.is_ok())
+            ),
+
+            Class::Grpc(res) => write!(
+                f,
+                "classification=\"{}\",grpc_status=\"{}\",error=\"\"",
+                class(res.is_ok()),
+                match res {
+                    Ok(code) | Err(code) => <i32>::from(*code),
+                }
+            ),
+
+            Class::Error(msg) => write!(
+                f,
+                "classification=\"failure\",grpc_status=\"\",error=\"{}\"",
+                msg
+            ),
         }
     }
 }

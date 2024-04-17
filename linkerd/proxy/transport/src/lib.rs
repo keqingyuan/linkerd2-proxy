@@ -3,7 +3,6 @@
 //! Uses unsafe code to interact with socket options for SO_ORIGINAL_DST.
 
 #![deny(
-    warnings,
     rust_2018_idioms,
     clippy::disallowed_methods,
     clippy::disallowed_types,
@@ -16,7 +15,7 @@ pub mod listen;
 pub mod orig_dst;
 
 pub use self::{
-    addrs::{ClientAddr, ListenAddr, Local, OrigDstAddr, Remote, ServerAddr},
+    addrs::{AddrPair, ClientAddr, ListenAddr, Local, OrigDstAddr, Remote, ServerAddr},
     connect::ConnectTcp,
     listen::{Bind, BindTcp},
     orig_dst::BindWithOrigDst,

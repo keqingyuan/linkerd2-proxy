@@ -1,6 +1,9 @@
-use crate::{policy, Inbound};
+use crate::{
+    policy::{self, AllowPolicy},
+    GatewayAddr, Inbound,
+};
 use linkerd_app_core::{
-    identity, io,
+    identity, io, profiles,
     proxy::http,
     svc::{self, ExtractParam, InsertParam, Param},
     tls,
@@ -8,7 +11,7 @@ use linkerd_app_core::{
     transport_header::{self, NewTransportHeaderServer, SessionProtocol, TransportHeader},
     Conditional, Error, Infallible, NameAddr, Result,
 };
-use std::{convert::TryFrom, fmt::Debug};
+use std::fmt::Debug;
 use thiserror::Error;
 use tracing::{debug_span, info_span};
 
@@ -25,11 +28,19 @@ pub struct RefusedNoIdentity(());
 #[error("a named target must be provided on gateway connections")]
 struct RefusedNoTarget;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct LocalTcp {
+    client_addr: Remote<ClientAddr>,
+    server_addr: Remote<ServerAddr>,
+    client_id: tls::ClientId,
+    policy: policy::AllowPolicy,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AuthorizedLocalTcp {
     addr: Remote<ServerAddr>,
     client_id: tls::ClientId,
-    permit: policy::Permit,
+    permit: policy::ServerPermit,
 }
 
 #[derive(Debug, Clone)]
@@ -78,34 +89,22 @@ impl<N> Inbound<N> {
     /// 2. TLS is required;
     /// 3. A transport header is expected. It's not strictly required, as
     ///    gateways may need to accept HTTP requests from older proxy versions
-    pub(crate) fn push_direct<T, I, NSvc, G, GSvc, H, HSvc>(
+    pub(crate) fn push_direct<T, I, NSvc>(
         self,
-        policies: impl policy::CheckPolicy + Clone + Send + Sync + 'static,
-        gateway: G,
-        http: H,
+        policies: impl policy::GetPolicy + Clone + Send + Sync + 'static,
+        gateway: svc::ArcNewTcp<GatewayTransportHeader, GatewayIo<I>>,
+        http: svc::ArcNewTcp<LocalHttp, io::PrefixedIo<TlsIo<I>>>,
     ) -> Inbound<svc::ArcNewTcp<T, I>>
     where
         T: Param<Remote<ClientAddr>> + Param<OrigDstAddr>,
         T: Clone + Send + 'static,
         I: io::AsyncRead + io::AsyncWrite + io::Peek + io::PeerAddr,
         I: Debug + Send + Sync + Unpin + 'static,
-        N: svc::NewService<LocalTcp, Service = NSvc> + Clone + Send + Sync + Unpin + 'static,
+        N: svc::NewService<AuthorizedLocalTcp, Service = NSvc>,
+        N: Clone + Send + Sync + Unpin + 'static,
         NSvc: svc::Service<FwdIo<I>, Response = ()> + Clone + Send + Sync + Unpin + 'static,
         NSvc::Error: Into<Error>,
         NSvc::Future: Send + Unpin,
-        G: svc::NewService<GatewayTransportHeader, Service = GSvc>
-            + Clone
-            + Send
-            + Sync
-            + Unpin
-            + 'static,
-        GSvc: svc::Service<GatewayIo<I>, Response = ()> + Send + 'static,
-        GSvc::Error: Into<Error>,
-        GSvc::Future: Send,
-        H: svc::NewService<LocalHttp, Service = HSvc> + Clone + Send + Sync + Unpin + 'static,
-        HSvc: svc::Service<io::PrefixedIo<TlsIo<I>>, Response = ()> + Send + 'static,
-        HSvc::Error: Into<Error>,
-        HSvc::Future: Send,
     {
         self.map_stack(|config, rt, inner| {
             let detect_timeout = config.proxy.detect_protocol_timeout;
@@ -120,7 +119,17 @@ impl<N> Inbound<N> {
                 .push(transport::metrics::NewServer::layer(
                     rt.metrics.proxy.transport.clone(),
                 ))
-                .instrument(|_: &_| debug_span!("opaque"))
+                .check_new_service::<AuthorizedLocalTcp, _>()
+                .push_map_target(|(permit, tcp): (policy::ServerPermit, LocalTcp)| {
+                    AuthorizedLocalTcp {
+                        addr: tcp.server_addr,
+                        client_id: tcp.client_id,
+                        permit,
+                    }
+                })
+                .check_new_service::<(policy::ServerPermit, LocalTcp), _>()
+                .push(policy::NewTcpPolicy::layer(rt.metrics.tcp_authz.clone()))
+                .instrument(|_: &_| debug_span!("opaq"))
                 .check_new_service::<LocalTcp, _>()
                 // When the transport header is present, it may be used for either local TCP
                 // forwarding, or we may be processing an HTTP gateway connection. HTTP gateway
@@ -130,35 +139,25 @@ impl<N> Inbound<N> {
                 .push_switch(
                     {
                         let policies = policies.clone();
-                        move |(h, client): (TransportHeader, ClientInfo)| -> Result<_> {
+                        move |(h, client): (TransportHeader, ClientInfo)| -> Result<_, Infallible> {
                             match h {
                                 TransportHeader {
                                     port,
                                     name: None,
                                     protocol,
-                                } => {
+                                } => Ok(svc::Either::A({
                                     // When the transport header targets an alternate port (but does
                                     // not identify an alternate target name), we check the new
-                                    // target's policy to determine whether the client can access
-                                    // it.
+                                    // target's policy (rather than the inbound proxy's address).
                                     let addr = (client.local_addr.ip(), port).into();
-                                    let policy = policies.check_policy(OrigDstAddr(addr))?;
-                                    let local = match protocol {
-                                        None => {
-                                            let tls = tls::ConditionalServerTls::Some(
-                                                tls::ServerTls::Established {
-                                                    client_id: Some(client.client_id.clone()),
-                                                    negotiated_protocol: client.alpn,
-                                                },
-                                            );
-                                            let permit = policy
-                                                .check_authorized(client.client_addr, &tls)?;
-                                            svc::Either::A(LocalTcp {
-                                                addr: Remote(ServerAddr(addr)),
-                                                permit,
-                                                client_id: client.client_id,
-                                            })
-                                        }
+                                    let policy = policies.get_policy(OrigDstAddr(addr));
+                                    match protocol {
+                                        None => svc::Either::A(LocalTcp {
+                                            server_addr: Remote(ServerAddr(addr)),
+                                            client_addr: client.client_addr,
+                                            client_id: client.client_id,
+                                            policy,
+                                        }),
                                         Some(protocol) => {
                                             // When TransportHeader includes the protocol, but does not
                                             // include an alternate name we go through the Inbound HTTP
@@ -170,32 +169,31 @@ impl<N> Inbound<N> {
                                                 client,
                                             })
                                         }
-                                    };
-                                    Ok(svc::Either::A(local))
-                                }
+                                    }
+                                })),
+
                                 TransportHeader {
                                     port,
                                     name: Some(name),
                                     protocol,
-                                } => {
+                                } => Ok(svc::Either::B({
                                     // When the transport header provides an alternate target, the
                                     // connection is a gateway connection. We check the _gateway
-                                    // address's_ policy to determine whether the client is
-                                    // authorized to use this gateway.
-                                    let policy = policies.check_policy(client.local_addr)?;
-                                    Ok(svc::Either::B(GatewayTransportHeader {
+                                    // address's_ policy (rather than the target address).
+                                    let policy = policies.get_policy(client.local_addr);
+                                    GatewayTransportHeader {
                                         target: NameAddr::from((name, port)),
                                         protocol,
                                         client,
                                         policy,
-                                    }))
-                                }
+                                    }
+                                })),
                             }
                         }
                     },
                     // HTTP detection is not necessary in this case, since the transport
                     // header indicates the connection's HTTP version.
-                    svc::stack(gateway.clone())
+                    svc::stack(gateway)
                         .push(transport::metrics::NewServer::layer(
                             rt.metrics.proxy.transport.clone(),
                         ))
@@ -206,18 +204,20 @@ impl<N> Inbound<N> {
                 )
                 .check_new_service::<(TransportHeader, ClientInfo), _>()
                 // Use ALPN to determine whether a transport header should be read.
+                .push(svc::ArcNewService::layer())
                 .push(NewTransportHeaderServer::layer(detect_timeout))
                 .check_new_service::<ClientInfo, _>()
-                .push_request_filter(|client: ClientInfo| -> Result<_> {
+                .push_filter(|t: (tls::ConditionalServerTls, T)| -> Result<_> {
+                    // Build a ClientInfo target for each accepted connection.
+                    // Refuse the connection if it doesn't include an mTLS
+                    // identity.
+                    let client = ClientInfo::try_from(t)?;
                     if client.header_negotiated() {
                         Ok(client)
                     } else {
                         Err(RefusedNoTarget.into())
                     }
                 })
-                // Build a ClientInfo target for each accepted connection. Refuse the
-                // connection if it doesn't include an mTLS identity.
-                .push_request_filter(ClientInfo::try_from)
                 .push(svc::ArcNewService::layer())
                 .push(tls::NewDetectTls::<identity::Server, _, _>::layer(
                     TlsParams {
@@ -225,9 +225,7 @@ impl<N> Inbound<N> {
                         identity,
                     },
                 ))
-                .check_new_service::<T, I>()
-                .push_on_service(svc::BoxService::layer())
-                .push(svc::ArcNewService::layer())
+                .arc_new_tcp()
         })
     }
 }
@@ -268,13 +266,36 @@ impl ClientInfo {
 
 // === impl LocalTcp ===
 
-impl Param<Remote<ServerAddr>> for LocalTcp {
+impl Param<Remote<ClientAddr>> for LocalTcp {
+    fn param(&self) -> Remote<ClientAddr> {
+        self.client_addr
+    }
+}
+
+impl Param<AllowPolicy> for LocalTcp {
+    fn param(&self) -> AllowPolicy {
+        self.policy.clone()
+    }
+}
+
+impl Param<tls::ConditionalServerTls> for LocalTcp {
+    fn param(&self) -> tls::ConditionalServerTls {
+        tls::ConditionalServerTls::Some(tls::ServerTls::Established {
+            client_id: Some(self.client_id.clone()),
+            negotiated_protocol: None,
+        })
+    }
+}
+
+// === impl AuthorizedLocalTcp ===
+
+impl Param<Remote<ServerAddr>> for AuthorizedLocalTcp {
     fn param(&self) -> Remote<ServerAddr> {
         self.addr
     }
 }
 
-impl Param<transport::labels::Key> for LocalTcp {
+impl Param<transport::labels::Key> for AuthorizedLocalTcp {
     fn param(&self) -> transport::labels::Key {
         transport::labels::Key::inbound_server(
             tls::ConditionalServerTls::Some(tls::ServerTls::Established {
@@ -358,6 +379,12 @@ impl svc::Param<tls::ConditionalServerTls> for LocalHttp {
 
 // === impl GatewayTransportHeader ===
 
+impl Param<GatewayAddr> for GatewayTransportHeader {
+    fn param(&self) -> GatewayAddr {
+        GatewayAddr(self.target.clone())
+    }
+}
+
 impl Param<transport::labels::Key> for GatewayTransportHeader {
     fn param(&self) -> transport::labels::Key {
         transport::labels::Key::inbound_server(
@@ -392,6 +419,24 @@ impl Param<tls::ConditionalServerTls> for GatewayTransportHeader {
             client_id: Some(self.client.client_id.clone()),
             negotiated_protocol: self.client.alpn.clone(),
         })
+    }
+}
+
+impl Param<tls::ClientId> for GatewayTransportHeader {
+    fn param(&self) -> tls::ClientId {
+        self.client.client_id.clone()
+    }
+}
+
+impl Param<Option<SessionProtocol>> for GatewayTransportHeader {
+    fn param(&self) -> Option<SessionProtocol> {
+        self.protocol.clone()
+    }
+}
+
+impl Param<profiles::LookupAddr> for GatewayTransportHeader {
+    fn param(&self) -> profiles::LookupAddr {
+        profiles::LookupAddr(self.target.clone().into())
     }
 }
 

@@ -1,27 +1,34 @@
-use super::Route;
-use futures::future;
+use futures::{future, FutureExt};
 use linkerd_app_core::{
     classify,
     http_metrics::retries::Handle,
-    metrics, profiles,
-    proxy::http::{ClientHandle, HttpBody},
+    metrics::{self, ProfileRouteLabels},
+    profiles::{self, http::Route},
+    proxy::http::{ClientHandle, EraseResponse, HttpBody},
     svc::{layer, Either, Param},
     Error,
 };
 use linkerd_http_classify::{Classify, ClassifyEos, ClassifyResponse};
-use linkerd_http_retry::ReplayBody;
+use linkerd_http_retry::{
+    with_trailers::{self, WithTrailers},
+    ReplayBody,
+};
 use linkerd_retry as retry;
 use std::sync::Arc;
 
 pub fn layer<N>(
-    metrics: metrics::HttpRouteRetry,
-) -> impl layer::Layer<N, Service = retry::NewRetry<NewRetryPolicy, N>> + Clone {
-    retry::NewRetry::<_, N>::layer(NewRetryPolicy::new(metrics))
+    metrics: metrics::HttpProfileRouteRetry,
+) -> impl layer::Layer<N, Service = retry::NewRetry<NewRetryPolicy, N, EraseResponse<()>>> + Clone {
+    retry::layer(NewRetryPolicy::new(metrics))
+        // Because we wrap the response body type on retries, we must include a
+        // `Proxy` middleware for unifying the response body types of the retry
+        // and non-retry services.
+        .with_proxy(EraseResponse::new(()))
 }
 
 #[derive(Clone, Debug)]
 pub struct NewRetryPolicy {
-    metrics: metrics::HttpRouteRetry,
+    metrics: metrics::HttpProfileRouteRetry,
 }
 
 #[derive(Clone, Debug)]
@@ -37,39 +44,43 @@ const MAX_BUFFERED_BYTES: usize = 64 * 1024;
 // === impl NewRetryPolicy ===
 
 impl NewRetryPolicy {
-    pub fn new(metrics: metrics::HttpRouteRetry) -> Self {
+    pub fn new(metrics: metrics::HttpProfileRouteRetry) -> Self {
         Self { metrics }
     }
 }
 
-impl retry::NewPolicy<Route> for NewRetryPolicy {
+impl<T> retry::NewPolicy<T> for NewRetryPolicy
+where
+    T: Param<Route> + Param<ProfileRouteLabels>,
+{
     type Policy = RetryPolicy;
 
-    fn new_policy(&self, route: &Route) -> Option<Self::Policy> {
-        let retries = route.route.retries().cloned()?;
-
-        let metrics = self.metrics.get_handle(route.param());
+    fn new_policy(&self, target: &T) -> Option<Self::Policy> {
+        let route: Route = target.param();
+        let labels: ProfileRouteLabels = target.param();
         Some(RetryPolicy {
-            metrics,
-            budget: retries.budget().clone(),
-            response_classes: route.route.response_classes().clone(),
+            metrics: self.metrics.get_handle(labels),
+            budget: route.retries()?.budget().clone(),
+            response_classes: route.response_classes().clone(),
         })
     }
 }
 
 // === impl Retry ===
 
-impl<A, B, E> retry::Policy<http::Request<ReplayBody<A>>, http::Response<B>, E> for RetryPolicy
+impl<A, B, E> retry::Policy<http::Request<ReplayBody<A>>, http::Response<WithTrailers<B>>, E>
+    for RetryPolicy
 where
     A: HttpBody + Unpin,
     A::Error: Into<Error>,
+    B: HttpBody + Unpin,
 {
     type Future = future::Ready<Self>;
 
     fn retry(
         &self,
         req: &http::Request<ReplayBody<A>>,
-        result: Result<&http::Response<B>, &E>,
+        result: Result<&http::Response<WithTrailers<B>>, &E>,
     ) -> Option<Self::Future> {
         let retryable = match result {
             Err(_) => false,
@@ -78,7 +89,7 @@ where
                 let is_failure = classify::Request::from(self.response_classes.clone())
                     .classify(req)
                     .start(rsp)
-                    .eos(None)
+                    .eos(rsp.body().trailers())
                     .is_failure();
                 // did the body exceed the maximum length limit?
                 let exceeded_max_len = req.body().is_capped();
@@ -120,16 +131,28 @@ where
             clone.extensions_mut().insert(client_handle);
         }
 
+        if let Some(classify) = req.extensions().get::<classify::Response>().cloned() {
+            clone.extensions_mut().insert(classify);
+        }
+
         Some(clone)
     }
 }
 
-impl<A, B, E> retry::PrepareRequest<http::Request<A>, http::Response<B>, E> for RetryPolicy
+impl<A, B, E> retry::PrepareRetry<http::Request<A>, http::Response<B>, E> for RetryPolicy
 where
     A: HttpBody + Unpin,
     A::Error: Into<Error>,
+    B: HttpBody + Unpin + Send + 'static,
+    B::Data: Unpin + Send,
+    B::Error: Unpin + Send,
 {
     type RetryRequest = http::Request<ReplayBody<A>>;
+    type RetryResponse = http::Response<WithTrailers<B>>;
+    type ResponseFuture = future::Map<
+        with_trailers::WithTrailersFuture<B>,
+        fn(http::Response<WithTrailers<B>>) -> Result<http::Response<WithTrailers<B>>, E>,
+    >;
 
     fn prepare_request(
         &self,
@@ -150,5 +173,11 @@ where
         // The body may still be too large to be buffered if the body's length was not known.
         // `ReplayBody` handles this gracefully.
         Either::A(http::Request::from_parts(head, replay_body))
+    }
+
+    /// If the response is HTTP/2, return a future that checks for a `TRAILERS`
+    /// frame immediately after the first frame of the response.
+    fn prepare_response(rsp: http::Response<B>) -> Self::ResponseFuture {
+        WithTrailers::map_response(rsp).map(Ok)
     }
 }

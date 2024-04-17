@@ -1,26 +1,26 @@
-use super::{discover, AllowPolicy, CheckPolicy, DefaultPolicy, DeniedUnknownPort};
-use linkerd_app_core::{proxy::http, transport::OrigDstAddr, Error, Result};
-pub use linkerd_server_policy::{Authentication, Authorization, Protocol, ServerPolicy, Suffix};
+use super::{api, AllowPolicy, DefaultPolicy, GetPolicy};
+use linkerd_app_core::{proxy::http, transport::OrigDstAddr, Error};
+use linkerd_idle_cache::IdleCache;
+pub use linkerd_proxy_server_policy::{Protocol, ServerPolicy};
+use rangemap::RangeInclusiveSet;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     hash::{BuildHasherDefault, Hasher},
     sync::Arc,
 };
-use tokio::sync::watch;
+use tokio::{sync::watch, time::Duration};
 use tracing::info_span;
 
-#[derive(Clone, Debug)]
-pub struct Store {
-    // When None, the default policy is 'deny'.
-    default: Option<Rx>,
-    ports: Arc<PortMap<Rx>>,
+#[derive(Clone)]
+pub struct Store<S> {
+    cache: IdleCache<u16, Rx, BuildHasherDefault<PortHasher>>,
+    default_rx: Rx,
+    opaque_ports: Arc<RangeInclusiveSet<u16>>,
+    opaque_default_rx: Rx,
+    discover: Option<api::Watch<S>>,
 }
 
-type Tx = watch::Sender<ServerPolicy>;
 type Rx = watch::Receiver<ServerPolicy>;
-
-/// A `HashMap` optimized for lookups by port number.
-type PortMap<T> = HashMap<u16, T, BuildHasherDefault<PortHasher>>;
 
 /// A hasher for ports.
 ///
@@ -31,105 +31,151 @@ struct PortHasher(u16);
 
 // === impl Store ===
 
-impl Store {
-    fn mk_default(default: DefaultPolicy) -> Option<(Tx, Rx)> {
-        match default {
-            DefaultPolicy::Deny => None,
-            DefaultPolicy::Allow(sp) => Some(watch::channel(sp)),
-        }
-    }
-
-    pub(crate) fn fixed(
-        default: impl Into<DefaultPolicy>,
+impl<S> Store<S> {
+    pub(crate) fn spawn_fixed(
+        default: DefaultPolicy,
+        idle_timeout: Duration,
         ports: impl IntoIterator<Item = (u16, ServerPolicy)>,
-    ) -> (Self, Option<Tx>) {
-        let rxs = ports
-            .into_iter()
-            .map(|(p, s)| {
+        opaque_ports: RangeInclusiveSet<u16>,
+    ) -> Self {
+        let opaque_default_rx = Self::spawn_default(Self::make_opaque(default.clone()));
+        let cache = {
+            let opaque_rxs = opaque_ports
+                .iter()
+                .flat_map(|range| range.clone().map(|port| (port, opaque_default_rx.clone())));
+            let rxs = ports.into_iter().map(|(p, s)| {
                 // When using a fixed policy, we don't need to watch for changes. It's
                 // safe to discard the sender, as the receiver will continue to let us
                 // borrow/clone each fixed policy.
                 let (_, rx) = watch::channel(s);
                 (p, rx)
-            })
-            .collect();
-
-        let (default_tx, default) = match Self::mk_default(default.into()) {
-            Some((tx, rx)) => (Some(tx), Some(rx)),
-            None => (None, None),
+            });
+            IdleCache::with_permanent_from_iter(idle_timeout, opaque_rxs.chain(rxs))
         };
 
-        let store = Self {
-            default,
-            ports: Arc::new(rxs),
-        };
-        (store, default_tx)
+        Self {
+            cache,
+            discover: None,
+            default_rx: Self::spawn_default(default),
+            opaque_ports: Arc::new(opaque_ports),
+            opaque_default_rx,
+        }
     }
 
     /// Spawns a watch for each of the given ports.
     ///
-    /// The returned future completes when a watch has been successfully created for all of the
-    /// provided ports. The store maintains these watches so that each time a policy is checked, it
-    /// may obtain the latest policy provided by the watch. An error is returned if any of the
-    /// watches cannot be established.
-    pub(super) fn spawn_discover<S>(
+    /// A discovery watch is spawned for each of the described `ports` and the
+    /// result is cached for as long as the `Store` is held. The `Store` may be used to
+    pub(super) fn spawn_discover(
         default: DefaultPolicy,
+        idle_timeout: Duration,
+        discover: api::Watch<S>,
         ports: HashSet<u16>,
-        discover: discover::Watch<S>,
+        opaque_ports: RangeInclusiveSet<u16>,
     ) -> Self
     where
         S: tonic::client::GrpcService<tonic::body::BoxBody, Error = Error>,
         S: Clone + Send + Sync + 'static,
         S::Future: Send,
-        S::ResponseBody: http::HttpBody<Error = Error> + Send + Sync + 'static,
+        S::ResponseBody:
+            http::HttpBody<Data = tonic::codegen::Bytes, Error = Error> + Default + Send + 'static,
     {
-        let rxs = ports
-            .into_iter()
-            .map(|port| {
+        let opaque_default = Self::make_opaque(default.clone());
+        // The initial set of policies never expire from the cache.
+        //
+        // Policies that are dynamically discovered at runtime will expire after
+        // `idle_timeout` to prevent holding policy watches indefinitely for
+        // ports that are generally unused.
+        let cache = {
+            let rxs = ports.into_iter().map(|port| {
                 let discover = discover.clone();
-                let default = default.clone();
-                let rx = info_span!("watch", %port)
+                let default = if opaque_ports.contains(&port) {
+                    opaque_default.clone()
+                } else {
+                    default.clone()
+                };
+                let rx = info_span!("watch", port)
                     .in_scope(|| discover.spawn_with_init(port, default.into()));
                 (port, rx)
-            })
-            .collect::<PortMap<_>>();
-
-        let default = match Self::mk_default(default) {
-            Some((tx, rx)) => {
-                tokio::spawn(async move {
-                    tx.closed().await;
-                });
-                Some(rx)
-            }
-            None => None,
+            });
+            IdleCache::with_permanent_from_iter(idle_timeout, rxs)
         };
 
         Self {
-            default,
-            ports: Arc::new(rxs),
+            cache,
+            discover: Some(discover),
+            default_rx: Self::spawn_default(default),
+            opaque_ports: Arc::new(opaque_ports),
+            opaque_default_rx: Self::spawn_default(opaque_default),
         }
+    }
+
+    fn make_opaque(default: DefaultPolicy) -> DefaultPolicy {
+        match default {
+            DefaultPolicy::Allow(mut policy) => {
+                policy.protocol = match policy.protocol {
+                    Protocol::Detect { tcp_authorizations, .. } => {
+                        Protocol::Opaque(tcp_authorizations)
+                    }
+                    opaq @ Protocol::Opaque(_) => opaq,
+                    _ => unreachable!("default policy must have been configured to detect prior to marking it opaque"),
+                };
+                DefaultPolicy::Allow(policy)
+            }
+            DefaultPolicy::Deny => DefaultPolicy::Deny,
+        }
+    }
+
+    fn spawn_default(default: DefaultPolicy) -> Rx {
+        let (tx, rx) = watch::channel(ServerPolicy::from(default));
+        // Hold the sender until all of the receivers are dropped. This ensures
+        // that receivers can be watched like any other policy.
+        tokio::spawn(async move {
+            tx.closed().await;
+        });
+        rx
     }
 }
 
-impl CheckPolicy for Store {
-    /// Checks that the destination port is configured to allow traffic.
-    ///
-    /// If the port is not explicitly configured, then the default policy is used. If the default
-    /// policy is `deny`, then a `DeniedUnknownPort` error is returned; otherwise an `AllowPolicy`
-    /// is returned that can be used to check whether the connection is permitted via
-    /// [`AllowPolicy::check_authorized`].
-    fn check_policy(&self, dst: OrigDstAddr) -> Result<AllowPolicy, DeniedUnknownPort> {
-        let server = self
-            .ports
-            .get(&dst.port())
-            .cloned()
-            .map(Ok)
-            .unwrap_or_else(|| match &self.default {
-                Some(rx) => Ok(rx.clone()),
-                None => Err(DeniedUnknownPort(dst.port())),
-            })?;
+impl<S> GetPolicy for Store<S>
+where
+    S: tonic::client::GrpcService<tonic::body::BoxBody, Error = Error>,
+    S: Clone + Send + Sync + 'static,
+    S::Future: Send,
+    S::ResponseBody:
+        http::HttpBody<Data = tonic::codegen::Bytes, Error = Error> + Default + Send + 'static,
+{
+    fn get_policy(&self, dst: OrigDstAddr) -> AllowPolicy {
+        // Lookup the policy for the target port in the cache. If it doesn't
+        // already exist, we spawn a watch on the API (if it is configured). If
+        // no discovery API is configured we use the default policy.
+        let server =
+            self.cache
+                .get_or_insert_with(dst.port(), |port| match self.discover.clone() {
+                    Some(disco) => info_span!("watch", port).in_scope(|| {
+                        let is_default_opaque = self.opaque_ports.contains(port);
+                        tracing::trace!(%port, is_default_opaque, "spawning policy discovery");
+                        // If the port is in the range of ports marked as
+                        // opaque, use the opaque default policy instead.
+                        let init = if is_default_opaque {
+                            self.opaque_default_rx.borrow().clone()
+                        } else {
+                            self.default_rx.borrow().clone()
+                        };
+                        disco.spawn_with_init(*port, init)
+                    }),
 
-        Ok(AllowPolicy { dst, server })
+                    // If no discovery API is configured, then we use the
+                    // default policy. Whlie it's a little wasteful to cache
+                    // these results separately, this case isn't expected to be
+                    // used outside of testing.
+                    None => {
+                        tracing::trace!(%port, "using the default policy");
+                        self.default_rx.clone()
+                    }
+                });
+
+        AllowPolicy { dst, server }
     }
 }
 

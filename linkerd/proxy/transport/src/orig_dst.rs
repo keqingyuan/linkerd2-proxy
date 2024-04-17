@@ -6,7 +6,7 @@ use futures::prelude::*;
 use linkerd_error::Result;
 use linkerd_io as io;
 use linkerd_stack::Param;
-use std::pin::Pin;
+use std::{net::SocketAddr, pin::Pin};
 use tokio::net::TcpStream;
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -23,6 +23,7 @@ pub struct Addrs<A = listen::Addrs> {
 // === impl Addrs ===
 
 impl<A> Param<OrigDstAddr> for Addrs<A> {
+    #[inline]
     fn param(&self) -> OrigDstAddr {
         self.orig_dst
     }
@@ -32,8 +33,20 @@ impl<A> Param<Remote<ClientAddr>> for Addrs<A>
 where
     A: Param<Remote<ClientAddr>>,
 {
+    #[inline]
     fn param(&self) -> Remote<ClientAddr> {
         self.inner.param()
+    }
+}
+
+impl<A> Param<AddrPair> for Addrs<A>
+where
+    A: Param<Remote<ClientAddr>>,
+{
+    #[inline]
+    fn param(&self) -> AddrPair {
+        let Remote(client) = self.inner.param();
+        AddrPair(client, ServerAddr(self.orig_dst.into()))
     }
 }
 
@@ -57,6 +70,7 @@ impl<B> From<B> for BindWithOrigDst<B> {
 impl<T, B> Bind<T> for BindWithOrigDst<B>
 where
     B: Bind<T, Io = TcpStream> + 'static,
+    B::Addrs: Param<Remote<ClientAddr>>,
 {
     type Addrs = Addrs<B::Addrs>;
     type Io = TcpStream;
@@ -68,7 +82,18 @@ where
 
         let incoming = incoming.map(|res| {
             let (inner, tcp) = res?;
-            let orig_dst = orig_dst_addr(&tcp)?;
+            let is_ipv4 = match inner.param() {
+                // used when binding to 0.0.0.0
+                Remote(ClientAddr(SocketAddr::V4(_))) => true,
+                // used when binding to ::
+                Remote(ClientAddr(SocketAddr::V6(a))) => a.ip().to_ipv4_mapped().is_some(),
+            };
+            let orig_dst = if is_ipv4 {
+                orig_dst_addr_v4(&tcp)?
+            } else {
+                orig_dst_addr_v6(&tcp)?
+            };
+            let orig_dst = OrigDstAddr(orig_dst);
             let addrs = Addrs { inner, orig_dst };
             Ok((addrs, tcp))
         });
@@ -79,16 +104,32 @@ where
 
 #[cfg(target_os = "linux")]
 #[allow(unsafe_code)]
-fn orig_dst_addr(sock: &TcpStream) -> io::Result<OrigDstAddr> {
+fn orig_dst_addr_v4(sock: &TcpStream) -> io::Result<SocketAddr> {
     use std::os::unix::io::AsRawFd;
 
     let fd = sock.as_raw_fd();
-    let r = unsafe { linux::so_original_dst(fd) };
-    r.map(OrigDstAddr)
+    unsafe { linux::so_original_dst_v4(fd) }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(unsafe_code)]
+fn orig_dst_addr_v6(sock: &TcpStream) -> io::Result<SocketAddr> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = sock.as_raw_fd();
+    unsafe { linux::so_original_dst_v6(fd) }
 }
 
 #[cfg(not(target_os = "linux"))]
-fn orig_dst_addr(_: &TcpStream) -> io::Result<OrigDstAddr> {
+fn orig_dst_addr_v4(_: &TcpStream) -> io::Result<OrigDstAddr> {
+    Err(io::Error::new(
+        io::ErrorKind::Other,
+        "SO_ORIGINAL_DST not supported on this operating system",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn orig_dst_addr_v6(_: &TcpStream) -> io::Result<OrigDstAddr> {
     Err(io::Error::new(
         io::ErrorKind::Other,
         "SO_ORIGINAL_DST not supported on this operating system",
@@ -101,26 +142,31 @@ mod linux {
     use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
     use std::os::unix::io::RawFd;
     use std::{io, mem};
-    use tracing::warn;
 
-    pub unsafe fn so_original_dst(fd: RawFd) -> io::Result<SocketAddr> {
+    pub unsafe fn so_original_dst(fd: RawFd, level: i32, optname: i32) -> io::Result<SocketAddr> {
         let mut sockaddr: libc::sockaddr_storage = mem::zeroed();
-        let mut socklen: libc::socklen_t = mem::size_of::<libc::sockaddr_storage>() as u32;
+        let mut sockaddr_len: libc::socklen_t = mem::size_of::<libc::sockaddr_storage>() as u32;
 
         let ret = libc::getsockopt(
             fd,
-            libc::SOL_IP,
-            libc::SO_ORIGINAL_DST,
+            level,
+            optname,
             &mut sockaddr as *mut _ as *mut _,
-            &mut socklen as *mut _ as *mut _,
+            &mut sockaddr_len as *mut _ as *mut _,
         );
         if ret != 0 {
-            let e = io::Error::last_os_error();
-            warn!("failed to read SO_ORIGINAL_DST: {:?}", e);
-            return Err(e);
+            return Err(io::Error::last_os_error());
         }
 
-        mk_addr(&sockaddr, socklen)
+        mk_addr(&sockaddr, sockaddr_len)
+    }
+
+    pub unsafe fn so_original_dst_v4(fd: RawFd) -> io::Result<SocketAddr> {
+        so_original_dst(fd, libc::SOL_IP, libc::SO_ORIGINAL_DST)
+    }
+
+    pub unsafe fn so_original_dst_v6(fd: RawFd) -> io::Result<SocketAddr> {
+        so_original_dst(fd, libc::SOL_IPV6, libc::IP6T_SO_ORIGINAL_DST)
     }
 
     // Borrowed with love from net2-rs

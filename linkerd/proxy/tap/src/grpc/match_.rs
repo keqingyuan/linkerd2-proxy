@@ -2,7 +2,7 @@ use crate::Inspect;
 use ipnet::{Ipv4Net, Ipv6Net};
 use linkerd2_proxy_api::net::ip_address;
 use linkerd2_proxy_api::tap::observe_request;
-use std::{boxed::Box, collections::BTreeMap, net, str::FromStr};
+use std::{collections::BTreeMap, net, str::FromStr};
 use thiserror::Error;
 
 #[derive(Clone, Debug)]
@@ -58,7 +58,7 @@ pub enum HttpMatch {
     Authority(observe_request::r#match::http::string_match::Match),
 }
 
-// ===== impl Match ======
+// === impl Match ===
 
 impl Match {
     fn from_seq(seq: observe_request::r#match::Seq) -> Result<Vec<Self>, InvalidMatch> {
@@ -85,7 +85,7 @@ impl Match {
                 .unwrap_or(false),
             Match::DestinationLabel(ref lbl) => inspect
                 .dst_labels(req)
-                .map(|l| lbl.matches(&*l))
+                .map(|l| lbl.matches(&l))
                 .unwrap_or(false),
             Match::RouteLabel(ref lbl) => inspect
                 .route_labels(req)
@@ -130,7 +130,7 @@ impl TryFrom<observe_request::r#match::Match> for Match {
     }
 }
 
-// ===== impl LabelMatch ======
+// === impl LabelMatch ===
 
 impl LabelMatch {
     fn matches(&self, labels: &BTreeMap<String, String>) -> bool {
@@ -153,7 +153,7 @@ impl TryFrom<observe_request::r#match::Label> for LabelMatch {
     }
 }
 
-// ===== impl TcpMatch ======
+// === impl TcpMatch ===
 
 impl TcpMatch {
     fn matches(&self, addr: net::SocketAddr) -> bool {
@@ -182,7 +182,7 @@ impl TryFrom<observe_request::r#match::Tcp> for TcpMatch {
                     debug_assert!(min == 0 && max == 0);
                     return Err(InvalidMatch::Empty);
                 }
-                if min > u32::from(::std::u16::MAX) || max > u32::from(::std::u16::MAX) {
+                if min > u32::from(u16::MAX) || max > u32::from(u16::MAX) {
                     return Err(InvalidMatch::InvalidPort);
                 }
                 if min > max {
@@ -196,7 +196,7 @@ impl TryFrom<observe_request::r#match::Tcp> for TcpMatch {
     }
 }
 
-// ===== impl NetMatch ======
+// === impl NetMatch ===
 
 impl NetMatch {
     fn matches(&self, addr: &net::IpAddr) -> bool {
@@ -219,7 +219,7 @@ impl TryFrom<observe_request::r#match::tcp::Netmask> for NetMatch {
     fn try_from(m: observe_request::r#match::tcp::Netmask) -> Result<Self, InvalidMatch> {
         let mask = if m.mask == 0 {
             return Err(InvalidMatch::Empty);
-        } else if m.mask > u32::from(::std::u8::MAX) {
+        } else if m.mask > u32::from(u8::MAX) {
             return Err(InvalidMatch::InvalidNetwork);
         } else {
             m.mask as u8
@@ -242,7 +242,7 @@ impl TryFrom<observe_request::r#match::tcp::Netmask> for NetMatch {
     }
 }
 
-// ===== impl HttpMatch ======
+// === impl HttpMatch ===
 
 impl HttpMatch {
     fn matches<B, I: Inspect>(&self, req: &http::Request<B>, inspect: &I) -> bool {
@@ -296,7 +296,7 @@ impl TryFrom<observe_request::r#match::Http> for HttpMatch {
             Pb::Method(m) => m
                 .r#type
                 .ok_or(InvalidMatch::Empty)
-                .and_then(|m| (&m).try_into().map_err(|_| InvalidMatch::InvalidHttpMethod))
+                .and_then(|m| m.try_into().map_err(|_| InvalidMatch::InvalidHttpMethod))
                 .map(HttpMatch::Method),
 
             Pb::Authority(a) => a
@@ -312,7 +312,6 @@ impl TryFrom<observe_request::r#match::Http> for HttpMatch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ipnet::{Ipv4Net, Ipv6Net};
     use linkerd2_proxy_api::http_types;
     use quickcheck::*;
     use std::collections::HashMap;
@@ -365,7 +364,7 @@ mod tests {
                                 Some(InvalidMatch::Empty)
                             } else if ps.min > ps.max && ps.max != 0 {
                                 Some(InvalidMatch::InvalidPort)
-                            } else if ps.min > u32::from(::std::u16::MAX) || ps.max > u32::from(::std::u16::MAX) {
+                            } else if ps.min > u32::from(u16::MAX) || ps.max > u32::from(u16::MAX) {
                                 Some(InvalidMatch::InvalidPort)
                             } else { None }
                         }

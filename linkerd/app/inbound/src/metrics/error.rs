@@ -3,17 +3,21 @@ mod tcp;
 
 pub(crate) use self::{http::HttpErrorMetrics, tcp::TcpErrorMetrics};
 use crate::{
-    policy::{DeniedUnauthorized, DeniedUnknownPort},
+    policy::{HttpRouteNotFound, HttpRouteUnauthorized, ServerUnauthorized},
     GatewayDomainInvalid, GatewayIdentityRequired, GatewayLoop,
 };
-use linkerd_app_core::{errors::FailFastError, metrics::FmtLabels, tls};
+use linkerd_app_core::{
+    errors::{FailFastError, LoadShedError},
+    metrics::FmtLabels,
+    tls,
+};
 use std::fmt;
 
 /// Inbound proxy error types.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 enum ErrorKind {
-    DeniedUnknown,
     FailFast,
+    LoadShed,
     GatewayDomainInvalid,
     GatewayIdentityRequired,
     GatewayLoop,
@@ -26,12 +30,15 @@ enum ErrorKind {
 
 impl ErrorKind {
     fn mk(err: &(dyn std::error::Error + 'static)) -> Option<Self> {
-        if err.is::<DeniedUnauthorized>() {
-            // Unauthorized metrics are tracked separately.and are not considered to be errors.
-            None
-        } else if err.is::<DeniedUnknownPort>() {
-            Some(ErrorKind::DeniedUnknown)
-        } else if err.is::<FailFastError>() {
+        // Policy-related metrics are tracked separately.
+        if err.is::<ServerUnauthorized>()
+            || err.is::<HttpRouteUnauthorized>()
+            || err.is::<HttpRouteNotFound>()
+        {
+            return None;
+        }
+
+        if err.is::<FailFastError>() {
             Some(ErrorKind::FailFast)
         } else if err.is::<std::io::Error>() {
             Some(ErrorKind::Io)
@@ -43,6 +50,8 @@ impl ErrorKind {
             Some(ErrorKind::GatewayIdentityRequired)
         } else if err.is::<GatewayLoop>() {
             Some(ErrorKind::GatewayLoop)
+        } else if err.is::<LoadShedError>() {
+            Some(ErrorKind::LoadShed)
         } else if let Some(e) = err.source() {
             Self::mk(e)
         } else {
@@ -57,7 +66,7 @@ impl FmtLabels for ErrorKind {
             f,
             "error=\"{}\"",
             match self {
-                ErrorKind::DeniedUnknown => "unknown port denied",
+                ErrorKind::LoadShed => "loadshed",
                 ErrorKind::FailFast => "failfast",
                 ErrorKind::TlsDetectTimeout => "tls detection timeout",
                 ErrorKind::GatewayIdentityRequired => "gateway identity required",

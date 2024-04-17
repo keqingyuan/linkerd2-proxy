@@ -1,9 +1,4 @@
-#![deny(
-    warnings,
-    rust_2018_idioms,
-    clippy::disallowed_methods,
-    clippy::disallowed_types
-)]
+#![deny(rust_2018_idioms, clippy::disallowed_methods, clippy::disallowed_types)]
 #![forbid(unsafe_code)]
 
 mod layer;
@@ -42,12 +37,7 @@ where
     L: Hash + Eq,
 {
     pub fn layer(&self, labels: L) -> TrackServiceLayer {
-        let metrics = self
-            .0
-            .lock()
-            .entry(labels)
-            .or_insert_with(Default::default)
-            .clone();
+        let metrics = self.0.lock().entry(labels).or_default().clone();
         TrackServiceLayer::new(metrics)
     }
 }

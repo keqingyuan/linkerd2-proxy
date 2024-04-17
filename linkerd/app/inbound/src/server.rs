@@ -1,11 +1,14 @@
 use crate::{direct, policy, Inbound};
-use futures::Stream;
 use linkerd_app_core::{
-    dns, io, metrics, profiles, serve, svc,
-    transport::{self, ClientAddr, Local, OrigDstAddr, Remote, ServerAddr},
-    Error, Result,
+    exp_backoff::ExponentialBackoff,
+    io, profiles,
+    proxy::http,
+    svc,
+    transport::{self, addrs::*},
+    Error,
 };
-use std::fmt::Debug;
+use linkerd_tonic_stream::ReceiveLimits;
+use std::{fmt::Debug, sync::Arc};
 use tracing::debug_span;
 
 #[derive(Copy, Clone, Debug)]
@@ -16,39 +19,42 @@ struct TcpEndpoint {
 // === impl Inbound ===
 
 impl Inbound<()> {
-    pub fn build_policies(
+    pub fn build_policies<C>(
         &self,
-        dns: dns::Resolver,
-        control_metrics: metrics::ControlHttp,
-    ) -> policy::Store {
+        workload: Arc<str>,
+        client: C,
+        backoff: ExponentialBackoff,
+        limits: ReceiveLimits,
+    ) -> impl policy::GetPolicy + Clone + Send + Sync + 'static
+    where
+        C: tonic::client::GrpcService<tonic::body::BoxBody, Error = Error>,
+        C: Clone + Unpin + Send + Sync + 'static,
+        C::ResponseBody: http::HttpBody<Data = tonic::codegen::Bytes, Error = Error>,
+        C::ResponseBody: Default + Send + 'static,
+        C::Future: Send,
+    {
         self.config
             .policy
             .clone()
-            .build(dns, control_metrics, self.runtime.identity.new_client())
+            .build(workload, client, backoff, limits)
     }
 
-    pub async fn serve<A, I, G, GSvc, P>(
+    pub fn mk<A, I, P>(
         self,
         addr: Local<ServerAddr>,
-        listen: impl Stream<Item = Result<(A, I)>> + Send + Sync + 'static,
-        policies: impl policy::CheckPolicy + Clone + Send + Sync + 'static,
+        policies: impl policy::GetPolicy + Clone + Send + Sync + 'static,
         profiles: P,
-        gateway: G,
-    ) where
-        A: svc::Param<Remote<ClientAddr>> + svc::Param<OrigDstAddr> + Clone + Send + Sync + 'static,
+        gateway: svc::ArcNewTcp<direct::GatewayTransportHeader, direct::GatewayIo<I>>,
+    ) -> svc::ArcNewTcp<A, I>
+    where
+        A: svc::Param<Remote<ClientAddr>>,
+        A: svc::Param<OrigDstAddr>,
+        A: svc::Param<AddrPair>,
+        A: Clone + Send + Sync + 'static,
         I: io::AsyncRead + io::AsyncWrite + io::Peek + io::PeerAddr,
         I: Debug + Unpin + Send + Sync + 'static,
-        G: svc::NewService<direct::GatewayTransportHeader, Service = GSvc>,
-        G: Clone + Send + Sync + Unpin + 'static,
-        GSvc: svc::Service<direct::GatewayIo<io::ScopedIo<I>>, Response = ()> + Send + 'static,
-        GSvc::Error: Into<Error>,
-        GSvc::Future: Send,
-        P: profiles::GetProfile<profiles::LookupAddr> + Clone + Send + Sync + Unpin + 'static,
-        P::Error: Send,
-        P::Future: Send,
+        P: profiles::GetProfile<Error = Error>,
     {
-        let shutdown = self.runtime.drain.clone().signaled();
-
         // Handles connections to ports that can't be determined to be HTTP.
         let forward = self
             .clone()
@@ -69,6 +75,7 @@ impl Inbound<()> {
                 .into_tcp_connect(addr.port())
                 .push_http_router(profiles.clone())
                 .push_http_server()
+                .push_http_tcp_server()
                 .into_inner();
 
             self.clone()
@@ -89,12 +96,10 @@ impl Inbound<()> {
 
         // Determines how to handle an inbound connection, dispatching it to the appropriate
         // stack.
-        let server = http
+        http.push_http_tcp_server()
             .push_detect(forward)
             .push_accept(addr.port(), policies, direct)
-            .into_inner();
-
-        serve::serve(listen, server, shutdown).await;
+            .into_inner()
     }
 }
 

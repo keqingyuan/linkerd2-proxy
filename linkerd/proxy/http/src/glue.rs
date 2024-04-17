@@ -1,4 +1,4 @@
-use crate::{upgrade::Http11Upgrade, HasH2Reason};
+use crate::upgrade::Http11Upgrade;
 use bytes::Bytes;
 use futures::TryFuture;
 use hyper::body::HttpBody;
@@ -24,12 +24,6 @@ pub struct UpgradeBody {
     pub(super) upgrade: Option<(Http11Upgrade, hyper::upgrade::OnUpgrade)>,
 }
 
-/// Glue for a `tower::Service` to used as a `hyper::server::Service`.
-#[derive(Debug)]
-pub struct HyperServerSvc<S> {
-    service: S,
-}
-
 /// Glue for any `tokio_connect::Connect` to implement `hyper::client::Connect`.
 #[derive(Debug, Clone)]
 pub struct HyperConnect<C, T> {
@@ -53,7 +47,7 @@ pub struct HyperConnectFuture<F> {
     inner: F,
     absolute_form: bool,
 }
-// ===== impl UpgradeBody =====
+// === impl UpgradeBody ===
 
 impl HttpBody for UpgradeBody {
     type Data = Bytes;
@@ -132,32 +126,7 @@ impl PinnedDrop for UpgradeBody {
     }
 }
 
-// ===== impl HyperServerSvc =====
-
-impl<S> HyperServerSvc<S> {
-    pub fn new(service: S) -> Self {
-        HyperServerSvc { service }
-    }
-}
-
-impl<S> tower::Service<http::Request<hyper::Body>> for HyperServerSvc<S>
-where
-    S: tower::Service<http::Request<UpgradeBody>>,
-{
-    type Response = S::Response;
-    type Error = S::Error;
-    type Future = S::Future;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.service.poll_ready(cx)
-    }
-
-    fn call(&mut self, req: http::Request<hyper::Body>) -> Self::Future {
-        self.service.call(req.map(UpgradeBody::from))
-    }
-}
-
-// ===== impl HyperConnect =====
+// === impl HyperConnect ===
 
 impl<C, T> HyperConnect<C, T> {
     pub(super) fn new(connect: C, target: T, absolute_form: bool) -> Self {
@@ -208,14 +177,6 @@ where
             transport,
             absolute_form: *this.absolute_form,
         }))
-    }
-}
-
-// === impl Error ===
-
-impl HasH2Reason for hyper::Error {
-    fn h2_reason(&self) -> Option<h2::Reason> {
-        (self as &(dyn std::error::Error + 'static)).h2_reason()
     }
 }
 

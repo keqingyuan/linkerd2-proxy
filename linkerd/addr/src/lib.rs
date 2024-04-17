@@ -1,17 +1,16 @@
-#![deny(
-    warnings,
-    rust_2018_idioms,
-    clippy::disallowed_methods,
-    clippy::disallowed_types
-)]
+#![deny(rust_2018_idioms, clippy::disallowed_methods, clippy::disallowed_types)]
 #![forbid(unsafe_code)]
 use linkerd_dns_name::Name;
 use std::{
     fmt,
     net::{IpAddr, SocketAddr},
     str::FromStr,
+    sync::Arc,
 };
 use thiserror::Error;
+
+mod addr_match;
+pub use self::addr_match::{AddrMatch, IpMatch, NameMatch};
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Addr {
@@ -21,7 +20,7 @@ pub enum Addr {
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct NameAddr {
-    name: Name,
+    name: Arc<Name>,
     port: u16,
 }
 
@@ -172,7 +171,10 @@ impl AsRef<Self> for Addr {
 
 impl From<(Name, u16)> for NameAddr {
     fn from((name, port): (Name, u16)) -> Self {
-        NameAddr { name, port }
+        NameAddr {
+            name: name.into(),
+            port,
+        }
     }
 }
 
@@ -196,9 +198,8 @@ impl NameAddr {
             return Err(Error::InvalidHost);
         }
 
-        Name::from_str(host)
-            .map(|name| NameAddr { name, port })
-            .map_err(|_| Error::InvalidHost)
+        let name = Name::from_str(host).map_err(|_| Error::InvalidHost)?;
+        Ok((name, port).into())
     }
 
     pub fn from_authority_with_default_port(

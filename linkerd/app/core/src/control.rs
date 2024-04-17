@@ -1,18 +1,19 @@
 use crate::{
-    classify, config, control, dns, identity, metrics, proxy::http, svc, tls,
-    transport::ConnectTcp, Addr, Error,
+    classify, config, dns, identity, metrics, proxy::http, svc, tls, transport::ConnectTcp, Addr,
+    Error,
 };
 use futures::future::Either;
+use linkerd_metrics::prom;
 use std::fmt;
 use tokio::time;
 use tokio_stream::{wrappers::IntervalStream, StreamExt};
-use tracing::warn;
+use tracing::{info_span, warn};
 
 #[derive(Clone, Debug)]
 pub struct Config {
     pub addr: ControlAddr,
     pub connect: config::ConnectConfig,
-    pub buffer_capacity: usize,
+    pub buffer: config::QueueConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -21,9 +22,44 @@ pub struct ControlAddr {
     pub identity: tls::ConditionalClientTls,
 }
 
+#[derive(Debug, thiserror::Error)]
+#[error("controller {addr}: {source}")]
+pub struct ControlError {
+    addr: Addr,
+    #[source]
+    source: Error,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("endpoint {addr}: {source}")]
+struct EndpointError {
+    addr: std::net::SocketAddr,
+    #[source]
+    source: Error,
+}
+
 impl svc::Param<Addr> for ControlAddr {
     fn param(&self) -> Addr {
         self.addr.clone()
+    }
+}
+
+impl svc::Param<svc::queue::Capacity> for ControlAddr {
+    fn param(&self) -> svc::queue::Capacity {
+        svc::queue::Capacity(1_000)
+    }
+}
+
+impl svc::Param<svc::queue::Timeout> for ControlAddr {
+    fn param(&self) -> svc::queue::Timeout {
+        const FAILFAST: time::Duration = time::Duration::from_secs(30);
+        svc::queue::Timeout(FAILFAST)
+    }
+}
+
+impl svc::Param<http::balance::EwmaConfig> for ControlAddr {
+    fn param(&self) -> http::balance::EwmaConfig {
+        EWMA_CONFIG
     }
 }
 
@@ -33,41 +69,49 @@ impl fmt::Display for ControlAddr {
     }
 }
 
-type BalanceBody =
-    http::balance::PendingUntilFirstDataBody<tower::load::peak_ewma::Handle, hyper::Body>;
+pub type RspBody =
+    linkerd_http_metrics::requests::ResponseBody<http::balance::Body<hyper::Body>, classify::Eos>;
 
-pub type RspBody = linkerd_http_metrics::requests::ResponseBody<BalanceBody, classify::Eos>;
+#[derive(Clone, Debug, Default)]
+pub struct Metrics {
+    balance: balance::Metrics,
+}
+
+const EWMA_CONFIG: http::balance::EwmaConfig = http::balance::EwmaConfig {
+    default_rtt: time::Duration::from_millis(30),
+    decay: time::Duration::from_secs(10),
+};
+
+impl Metrics {
+    pub fn register(registry: &mut prom::Registry) -> Self {
+        Metrics {
+            balance: balance::Metrics::register(registry.sub_registry_with_prefix("balancer")),
+        }
+    }
+}
 
 impl Config {
     pub fn build(
         self,
         dns: dns::Resolver,
-        metrics: metrics::ControlHttp,
+        legacy_metrics: metrics::ControlHttp,
+        metrics: Metrics,
         identity: identity::NewClient,
     ) -> svc::ArcNewService<
         (),
-        impl svc::Service<
-                http::Request<tonic::body::BoxBody>,
-                Response = http::Response<RspBody>,
-                Error = Error,
-                Future = impl Send,
-            > + Clone,
+        svc::BoxCloneSyncService<http::Request<tonic::body::BoxBody>, http::Response<RspBody>>,
     > {
         let addr = self.addr;
+        tracing::trace!(%addr, "Building");
 
         // When a DNS resolution fails, log the error and use the TTL, if there
         // is one, to drive re-resolution attempts.
         let resolve_backoff = {
             let backoff = self.connect.backoff;
             move |error: Error| {
-                warn!(%error, "Failed to resolve control-plane component");
-                if let Some(e) = error.downcast_ref::<dns::ResolveError>() {
-                    if let dns::ResolveErrorKind::NoRecordsFound {
-                        negative_ttl: Some(ttl_secs),
-                        ..
-                    } = e.kind()
-                    {
-                        let ttl = time::Duration::from_secs(*ttl_secs as u64);
+                warn!(error, "Failed to resolve control-plane component");
+                if let Some(e) = crate::errors::cause_ref::<dns::ResolveError>(&*error) {
+                    if let Some(ttl) = e.negative_ttl() {
                         return Ok(Either::Left(
                             IntervalStream::new(time::interval(ttl)).map(|_| ()),
                         ));
@@ -80,38 +124,65 @@ impl Config {
             }
         };
 
-        svc::stack(ConnectTcp::new(self.connect.keepalive))
+        let client = svc::stack(ConnectTcp::new(self.connect.keepalive))
             .push(tls::Client::layer(identity))
             .push_connect_timeout(self.connect.timeout)
             .push_map_target(|(_version, target)| target)
-            .push(self::client::layer())
-            .push_on_service(svc::MapErr::layer(Into::into))
-            .into_new_service()
-            // Ensure that connection is driven independently of the load balancer; but don't drive
-            // reconnection independently of the balancer. This ensures that new connections are
-            // only initiated when the balancer tries to move pending endpoints to ready (i.e. after
-            // checking for discovery updates); but we don't want to continually reconnect without
-            // checking for discovery updates.
+            .push(self::client::layer(self.connect.h2_settings))
+            .push_on_service(svc::MapErr::layer_boxed())
+            .into_new_service();
+
+        let endpoint = client
+            // Ensure that connection is driven independently of the load
+            // balancer; but don't drive reconnection independently of the
+            // balancer. This ensures that new connections are only initiated
+            // when the balancer tries to move pending endpoints to ready (i.e.
+            // after checking for discovery updates); but we don't want to
+            // continually reconnect without checking for discovery updates.
             .push_on_service(svc::layer::mk(svc::SpawnReady::new))
+            .push(svc::NewMapErr::layer_from_target::<EndpointError, _>())
             .push_new_reconnect(self.connect.backoff)
-            .instrument(|t: &self::client::Target| tracing::info_span!("endpoint", addr = %t.addr))
-            .push(self::resolve::layer(dns, resolve_backoff))
-            .push_on_service(self::control::balance::layer())
-            .into_new_service()
-            .push(metrics.to_layer::<classify::Response, _, _>())
+            .instrument(|t: &self::client::Target| info_span!("endpoint", addr = %t.addr));
+
+        let balance = endpoint
+            .lift_new()
+            .push(self::balance::layer(metrics.balance, dns, resolve_backoff))
+            .push(legacy_metrics.to_layer::<classify::Response, _, _>())
+            .push(classify::NewClassify::layer_default());
+
+        balance
             .push(self::add_origin::layer())
-            .push_on_service(svc::layers().push_spawn_buffer(self.buffer_capacity))
-            .instrument(|c: &ControlAddr| tracing::info_span!("controller", addr = %c.addr))
+            .push(svc::NewMapErr::layer_from_target::<ControlError, _>())
+            .instrument(|c: &ControlAddr| info_span!("controller", addr = %c.addr))
             .push_map_target(move |()| addr.clone())
+            .push_on_service(svc::BoxCloneSyncService::layer())
             .push(svc::ArcNewService::layer())
             .into_inner()
+    }
+}
+
+impl From<(&ControlAddr, Error)> for ControlError {
+    fn from((controller, source): (&ControlAddr, Error)) -> Self {
+        Self {
+            addr: controller.addr.clone(),
+            source,
+        }
+    }
+}
+
+impl From<(&self::client::Target, Error)> for EndpointError {
+    fn from((target, source): (&self::client::Target, Error)) -> Self {
+        Self {
+            addr: target.addr,
+            source,
+        }
     }
 }
 
 /// Sets the request's URI from `Config`.
 mod add_origin {
     use super::ControlAddr;
-    use linkerd_stack::{layer, NewService};
+    use crate::svc::{layer, NewService};
     use std::task::{Context, Poll};
 
     pub fn layer<M>() -> impl layer::Layer<M, Service = NewAddOrigin<M>> + Clone {
@@ -167,68 +238,88 @@ mod add_origin {
     }
 }
 
-mod resolve {
-    use super::client::Target;
+mod balance {
+    use super::{client::Target, ControlAddr};
     use crate::{
         dns,
-        proxy::{
-            discover,
-            dns_resolve::DnsResolve,
-            resolve::{map_endpoint, recover},
-        },
-        svc,
+        metrics::prom::encoding::EncodeLabelSet,
+        proxy::{dns_resolve::DnsResolve, http, resolve::recover},
+        svc, tls,
     };
-    use linkerd_error::Recover;
+    use linkerd_stack::ExtractParam;
     use std::net::SocketAddr;
 
-    pub fn layer<M, R>(
+    pub(super) type Metrics = http::balance::MetricFamilies<Labels>;
+
+    pub fn layer<B, R: Clone, N>(
+        metrics: Metrics,
         dns: dns::Resolver,
         recover: R,
-    ) -> impl svc::Layer<M, Service = Discover<M, R>>
-    where
-        R: Recover + Clone,
-        R::Backoff: Unpin,
-    {
-        svc::layer::mk(move |endpoint| {
-            discover::resolve(
-                endpoint,
-                map_endpoint::Resolve::new(
-                    IntoTarget(()),
-                    recover::Resolve::new(recover.clone(), DnsResolve::new(dns.clone())),
-                ),
+    ) -> impl svc::Layer<
+        N,
+        Service = http::NewBalance<B, Params, recover::Resolve<R, DnsResolve>, NewIntoTarget<N>>,
+    > {
+        let resolve = recover::Resolve::new(recover, DnsResolve::new(dns));
+        svc::layer::mk(move |inner| {
+            http::NewBalance::new(
+                NewIntoTarget { inner },
+                resolve.clone(),
+                Params(metrics.clone()),
             )
         })
     }
 
-    type Discover<M, R> = discover::MakeEndpoint<
-        discover::FromResolve<
-            map_endpoint::Resolve<IntoTarget, recover::Resolve<R, DnsResolve>>,
-            Target,
-        >,
-        M,
-    >;
+    #[derive(Clone, Debug)]
+    pub struct Params(http::balance::MetricFamilies<Labels>);
 
-    #[derive(Copy, Clone, Debug)]
-    pub struct IntoTarget(());
+    #[derive(Clone, Debug)]
+    pub struct NewIntoTarget<N> {
+        inner: N,
+    }
 
-    impl map_endpoint::MapEndpoint<super::ControlAddr, ()> for IntoTarget {
-        type Out = Target;
+    #[derive(Clone, Debug)]
+    pub struct IntoTarget<N> {
+        inner: N,
+        server_id: tls::ConditionalClientTls,
+    }
 
-        fn map_endpoint(&self, control: &super::ControlAddr, addr: SocketAddr, _: ()) -> Self::Out {
-            Target::new(addr, control.identity.clone())
+    #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+    pub(super) struct Labels {
+        addr: String,
+    }
+
+    // === impl NewIntoTarget ===
+
+    impl<N: svc::NewService<ControlAddr>> svc::NewService<ControlAddr> for NewIntoTarget<N> {
+        type Service = IntoTarget<N::Service>;
+
+        fn new_service(&self, control: ControlAddr) -> Self::Service {
+            IntoTarget {
+                server_id: control.identity.clone(),
+                inner: self.inner.new_service(control),
+            }
         }
     }
-}
 
-mod balance {
-    use crate::proxy::http;
-    use std::time::Duration;
+    // === impl IntoTarget ===
 
-    const EWMA_DEFAULT_RTT: Duration = Duration::from_millis(30);
-    const EWMA_DECAY: Duration = Duration::from_secs(10);
+    impl<N: svc::NewService<Target>> svc::NewService<(SocketAddr, ())> for IntoTarget<N> {
+        type Service = N::Service;
 
-    pub fn layer<A, B>() -> http::balance::Layer<A, B> {
-        http::balance::layer(EWMA_DEFAULT_RTT, EWMA_DECAY)
+        fn new_service(&self, (addr, ()): (SocketAddr, ())) -> Self::Service {
+            self.inner
+                .new_service(Target::new(addr, self.server_id.clone()))
+        }
+    }
+
+    // === impl Metrics ===
+
+    impl ExtractParam<http::balance::Metrics, ControlAddr> for Params {
+        fn extract_param(&self, tgt: &ControlAddr) -> http::balance::Metrics {
+            self.0.metrics(&Labels {
+                addr: tgt.addr.to_string(),
+            })
+        }
     }
 }
 
@@ -240,10 +331,7 @@ mod client {
         transport::{Remote, ServerAddr},
     };
     use linkerd_proxy_http::h2::Settings as H2Settings;
-    use std::{
-        net::SocketAddr,
-        task::{Context, Poll},
-    };
+    use std::net::SocketAddr;
 
     #[derive(Clone, Hash, Debug, Eq, PartialEq)]
     pub struct Target {
@@ -255,11 +343,6 @@ mod client {
         pub(super) fn new(addr: SocketAddr, server_id: tls::ConditionalClientTls) -> Self {
             Self { addr, server_id }
         }
-    }
-
-    #[derive(Debug)]
-    pub struct Client<C, B> {
-        inner: http::h2::Connect<C, B>,
     }
 
     // === impl Target ===
@@ -284,47 +367,12 @@ mod client {
 
     // === impl Layer ===
 
-    pub fn layer<C, B>() -> impl svc::Layer<C, Service = Client<C, B>> + Copy
+    pub fn layer<C, B>(
+        settings: H2Settings,
+    ) -> impl svc::Layer<C, Service = http::h2::Connect<C, B>> + Copy
     where
         http::h2::Connect<C, B>: tower::Service<Target>,
     {
-        svc::layer::mk(|mk_conn| {
-            let inner = http::h2::Connect::new(mk_conn, H2Settings::default());
-            Client { inner }
-        })
-    }
-
-    // === impl Client ===
-
-    impl<C, B> tower::Service<Target> for Client<C, B>
-    where
-        http::h2::Connect<C, B>: tower::Service<Target>,
-    {
-        type Response = <http::h2::Connect<C, B> as tower::Service<Target>>::Response;
-        type Error = <http::h2::Connect<C, B> as tower::Service<Target>>::Error;
-        type Future = <http::h2::Connect<C, B> as tower::Service<Target>>::Future;
-
-        #[inline]
-        fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-            self.inner.poll_ready(cx)
-        }
-
-        #[inline]
-        fn call(&mut self, target: Target) -> Self::Future {
-            self.inner.call(target)
-        }
-    }
-
-    // A manual impl is needed since derive adds `B: Clone`, but that's just
-    // a PhantomData.
-    impl<C, B> Clone for Client<C, B>
-    where
-        http::h2::Connect<C, B>: Clone,
-    {
-        fn clone(&self) -> Self {
-            Client {
-                inner: self.inner.clone(),
-            }
-        }
+        svc::layer::mk(move |mk_conn| http::h2::Connect::new(mk_conn, settings))
     }
 }

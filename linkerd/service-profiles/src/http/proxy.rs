@@ -1,10 +1,11 @@
 use super::{RequestMatch, Route};
 use crate::{Profile, Receiver, ReceiverStream};
-use futures::{future, prelude::*};
+use futures::prelude::*;
 use linkerd_error::{Error, Result};
 use linkerd_stack::{layer, NewService, Param, Proxy, Service};
 use std::{
     collections::{hash_map, HashMap, HashSet},
+    sync::Arc,
     task::{Context, Poll},
 };
 use tracing::{debug, trace};
@@ -12,8 +13,8 @@ use tracing::{debug, trace};
 /// A router that uses a per-route `Proxy` to wrap a common underlying
 /// `Service`.
 ///
-/// This router is similar to `linkerd_stack::NewRouter` and
-/// `linkerd_cache::Cache` with a few differences:
+/// This router is similar to `linkerd_router::NewOneshotRoute` and
+/// `linkerd_router::Cache` with a few differences:
 ///
 /// * It's `Proxy`-specific;
 /// * Routes are constructed eagerly as the profile updates;
@@ -31,7 +32,7 @@ pub struct ProxyRouter<T, N, P, S> {
     inner: S,
     target: T,
     rx: ReceiverStream,
-    http_routes: Vec<(RequestMatch, Route)>,
+    http_routes: Arc<[(RequestMatch, Route)]>,
     proxies: HashMap<Route, P>,
 }
 
@@ -61,7 +62,7 @@ where
             inner,
             target,
             rx: rx.into(),
-            http_routes: Vec::new(),
+            http_routes: std::iter::empty().collect(),
             proxies: HashMap::new(),
             new_proxy: self.new_proxy.clone(),
         }

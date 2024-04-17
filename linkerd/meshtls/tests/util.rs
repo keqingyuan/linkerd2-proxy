@@ -3,23 +3,68 @@
 
 use futures::prelude::*;
 use linkerd_conditional::Conditional;
+use linkerd_dns_name::Name;
 use linkerd_error::Infallible;
-use linkerd_identity::{Credentials, DerX509, Name};
+use linkerd_identity::{Credentials, DerX509, Id};
 use linkerd_io::{self as io, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use linkerd_meshtls as meshtls;
 use linkerd_proxy_transport::{
     addrs::*,
     listen::{Addrs, Bind, BindTcp},
-    ConnectTcp, Keepalive, ListenAddr,
+    ConnectTcp, Keepalive,
 };
 use linkerd_stack::{
     layer::Layer, service_fn, ExtractParam, InsertParam, NewService, Param, ServiceExt,
 };
 use linkerd_tls as tls;
 use linkerd_tls_test_util as test_util;
-use std::{future::Future, net::SocketAddr, sync::mpsc, time::Duration};
+use rcgen::{BasicConstraints, Certificate, CertificateParams, IsCa, SanType};
+use std::str::FromStr;
+use std::{
+    net::SocketAddr,
+    sync::mpsc,
+    time::{Duration, SystemTime},
+};
 use tokio::net::TcpStream;
 use tracing::Instrument;
+
+fn generate_cert_with_name(subject_alt_names: Vec<SanType>) -> (Vec<u8>, Vec<u8>, String) {
+    let mut root_params = CertificateParams::default();
+    root_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let root_cert = Certificate::from_params(root_params).expect("should generate root");
+
+    let mut params = CertificateParams::default();
+    params.subject_alt_names = subject_alt_names;
+
+    let cert = Certificate::from_params(params).expect("should generate cert");
+
+    (
+        cert.serialize_der_with_signer(&root_cert)
+            .expect("should serialize"),
+        cert.serialize_private_key_der(),
+        root_cert.serialize_pem().expect("should serialize"),
+    )
+}
+
+pub fn fails_processing_cert_when_wrong_id_configured(mode: meshtls::Mode) {
+    let server_name = Name::from_str("system.local").expect("should parse");
+    let id = Id::Dns(server_name.clone());
+
+    let (cert, key, roots) =
+        generate_cert_with_name(vec![SanType::URI("spiffe://system/local".into())]);
+    let (mut store, _) = mode
+        .watch(id, server_name.clone(), &roots)
+        .expect("should construct");
+
+    let err = store
+        .set_certificate(DerX509(cert), vec![], key, SystemTime::now())
+        .expect_err("should error");
+
+    assert_eq!(
+        "certificate does not match TLS identity",
+        format!("{}", err),
+    );
+}
 
 pub async fn plaintext(mode: meshtls::Mode) {
     let (_foo, _, server_tls) = load(mode, &test_util::FOO_NS1);
@@ -49,10 +94,11 @@ pub async fn plaintext(mode: meshtls::Mode) {
 pub async fn proxy_to_proxy_tls_works(mode: meshtls::Mode) {
     let (_foo, _, server_tls) = load(mode, &test_util::FOO_NS1);
     let (_bar, client_tls, _) = load(mode, &test_util::BAR_NS1);
-    let server_id = tls::ServerId(test_util::FOO_NS1.name.parse().unwrap());
+    let server_id = tls::ServerId(test_util::FOO_NS1.id.parse().unwrap());
+    let server_name = tls::ServerName(test_util::FOO_NS1.name.parse().unwrap());
     let (client_result, server_result) = run_test(
         client_tls.clone(),
-        Conditional::Some(server_id.clone()),
+        Conditional::Some(tls::ClientTls::new(server_id.clone(), server_name.clone())),
         |conn| write_then_read(conn, PING),
         server_tls,
         |(_, conn)| read_then_write(conn, PING.len(), PONG),
@@ -60,10 +106,10 @@ pub async fn proxy_to_proxy_tls_works(mode: meshtls::Mode) {
     .await;
     assert_eq!(
         client_result.tls,
-        Some(Conditional::Some(tls::ClientTls {
+        Some(Conditional::Some(tls::ClientTls::new(
             server_id,
-            alpn: None,
-        }))
+            server_name,
+        )))
     );
     assert_eq!(&client_result.result.expect("pong")[..], PONG);
     assert_eq!(
@@ -82,11 +128,12 @@ pub async fn proxy_to_proxy_tls_pass_through_when_identity_does_not_match(mode: 
     // Misuse the client's identity instead of the server's identity. Any
     // identity other than `server_tls.server_identity` would work.
     let (_bar, client_tls, _) = load(mode, &test_util::BAR_NS1);
-    let sni = test_util::BAR_NS1.name.parse::<Name>().unwrap();
+    let server_id = test_util::BAR_NS1.id.parse::<tls::ServerId>().unwrap();
+    let server_name = test_util::BAR_NS1.name.parse::<tls::ServerName>().unwrap();
 
     let (client_result, server_result) = run_test(
         client_tls,
-        Conditional::Some(tls::ServerId(sni.clone())),
+        Conditional::Some(tls::ClientTls::new(server_id.clone(), server_name.clone())),
         |conn| write_then_read(conn, PING),
         server_tls,
         |(_, conn)| read_then_write(conn, START_OF_TLS.len(), PONG),
@@ -100,7 +147,7 @@ pub async fn proxy_to_proxy_tls_pass_through_when_identity_does_not_match(mode: 
     assert_eq!(
         server_result.tls,
         Some(Conditional::Some(tls::ServerTls::Passthru {
-            sni: tls::ServerId(sni)
+            sni: server_name
         }))
     );
     assert_eq!(&server_result.result.unwrap()[..], START_OF_TLS);
@@ -119,15 +166,18 @@ fn load(
     let (mut store, rx) = mode
         .watch(
             ent.name.parse().unwrap(),
+            ent.name.parse().unwrap(),
             roots_pem,
-            ent.key,
-            b"fake CSR data",
         )
         .expect("credentials must be readable");
 
-    let expiry = std::time::SystemTime::now() + Duration::from_secs(600);
     store
-        .set_certificate(DerX509(ent.crt.to_vec()), vec![], expiry)
+        .set_certificate(
+            DerX509(ent.crt.to_vec()),
+            vec![],
+            ent.key.to_vec(),
+            SystemTime::now() + Duration::from_secs(1000),
+        )
         .expect("certificate must be valid");
 
     (store, rx.new_client(), rx.server())
@@ -153,7 +203,7 @@ type ClientIo =
 /// side.
 async fn run_test<C, CF, CR, S, SF, SR>(
     client_tls: meshtls::NewClient,
-    client_server_id: Conditional<tls::ServerId, tls::NoClientTls>,
+    client_server_id: Conditional<tls::ClientTls, tls::NoClientTls>,
     client: C,
     server_tls: meshtls::Server,
     server: S,
@@ -230,11 +280,11 @@ where
         // parallels the server side.
         let (sender, receiver) = mpsc::channel::<Transported<tls::ConditionalClientTls, CR>>();
 
-        let tls = Some(client_server_id.clone().map(Into::into));
+        let tls = Some(client_server_id.clone());
         let client = async move {
             let conn = tls::Client::layer(client_tls)
                 .layer(ConnectTcp::new(Keepalive(None)))
-                .oneshot(Target(server_addr.into(), client_server_id.map(Into::into)))
+                .oneshot(Target(server_addr.into(), client_server_id))
                 .await;
             match conn {
                 Err(e) => {
@@ -357,7 +407,7 @@ impl Param<Keepalive> for Server {
     }
 }
 
-/// === impl ServerParams ===
+// === impl ServerParams ===
 
 impl<T> ExtractParam<tls::server::Timeout, T> for ServerParams {
     fn extract_param(&self, _: &T) -> tls::server::Timeout {

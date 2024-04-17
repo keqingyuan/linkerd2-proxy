@@ -10,7 +10,7 @@
 //!   tracing configuration).
 //! * `POST /shutdown` -- shuts down the proxy.
 
-use futures::future;
+use futures::future::{self, TryFutureExt};
 use http::StatusCode;
 use hyper::{
     body::{Body, HttpBody},
@@ -19,7 +19,7 @@ use hyper::{
 use linkerd_app_core::{
     metrics::{self as metrics, FmtMetrics},
     proxy::http::ClientHandle,
-    trace, Error,
+    trace, Error, Result,
 };
 use std::{
     future::Future,
@@ -28,7 +28,8 @@ use std::{
 };
 use tokio::sync::mpsc;
 
-mod level;
+mod json;
+mod log;
 mod readiness;
 
 pub use self::readiness::{Latch, Readiness};
@@ -39,10 +40,11 @@ pub struct Admin<M> {
     tracing: trace::Handle,
     ready: Readiness,
     shutdown_tx: mpsc::UnboundedSender<()>,
+    #[cfg(feature = "pprof")]
+    pprof: Option<crate::pprof::Pprof>,
 }
 
-pub type ResponseFuture =
-    Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send + 'static>>;
+pub type ResponseFuture = Pin<Box<dyn Future<Output = Result<Response<Body>>> + Send + 'static>>;
 
 impl<M> Admin<M> {
     pub fn new(
@@ -56,7 +58,16 @@ impl<M> Admin<M> {
             ready,
             shutdown_tx,
             tracing,
+
+            #[cfg(feature = "pprof")]
+            pprof: None,
         }
+    }
+
+    #[cfg(feature = "pprof")]
+    pub fn with_profiling(mut self, enabled: bool) -> Self {
+        self.pprof = enabled.then_some(crate::pprof::Pprof);
+        self
     }
 
     fn ready_rsp(&self) -> Response<Body> {
@@ -80,6 +91,52 @@ impl<M> Admin<M> {
             .header(http::header::CONTENT_TYPE, "text/plain")
             .body("live\n".into())
             .expect("builder with known status code must not fail")
+    }
+
+    fn env_rsp<B>(req: Request<B>) -> Response<Body> {
+        use std::{collections::HashMap, env, ffi::OsString};
+
+        if req.method() != http::Method::GET {
+            return Self::method_not_allowed();
+        }
+
+        if let Err(not_acceptable) = json::accepts_json(&req) {
+            return not_acceptable;
+        }
+
+        fn unicode(s: OsString) -> String {
+            s.to_string_lossy().into_owned()
+        }
+
+        let query = req
+            .uri()
+            .path_and_query()
+            .and_then(http::uri::PathAndQuery::query);
+        let env = if let Some(query) = query {
+            if query.contains('=') {
+                return json::json_error_rsp(
+                    "env.json query parameters may not contain key-value pairs",
+                    StatusCode::BAD_REQUEST,
+                );
+            }
+            query
+                .split('&')
+                .map(|qparam| {
+                    let var = match std::env::var(qparam) {
+                        Err(env::VarError::NotPresent) => None,
+                        Err(env::VarError::NotUnicode(bad)) => Some(unicode(bad)),
+                        Ok(var) => Some(var),
+                    };
+                    (qparam.to_string(), var)
+                })
+                .collect::<HashMap<String, Option<String>>>()
+        } else {
+            std::env::vars_os()
+                .map(|(key, var)| (unicode(key), Some(unicode(var))))
+                .collect::<HashMap<String, Option<String>>>()
+        };
+
+        json::json_rsp(&env)
     }
 
     fn shutdown(&self) -> Response<Body> {
@@ -139,7 +196,7 @@ impl<M> Admin<M> {
 impl<M, B> tower::Service<http::Request<B>> for Admin<M>
 where
     M: FmtMetrics,
-    B: HttpBody + Send + Sync + 'static,
+    B: HttpBody + Send + 'static,
     B::Error: Into<Error>,
     B::Data: Send,
 {
@@ -162,25 +219,39 @@ where
                 });
                 Box::pin(future::ok(rsp))
             }
+
             "/proxy-log-level" => {
-                if Self::client_is_localhost(&req) {
-                    let level = self.tracing.level().cloned();
-                    Box::pin(async move {
-                        let rsp = match level {
-                            Some(level) => {
-                                level::serve(&level, req).await.unwrap_or_else(|error| {
-                                    tracing::error!(%error, "Failed to get/set tracing level");
-                                    Self::internal_error_rsp(error)
-                                })
-                            }
-                            None => Self::not_found(),
-                        };
-                        Ok(rsp)
-                    })
-                } else {
-                    Box::pin(future::ok(Self::forbidden_not_localhost()))
+                if !Self::client_is_localhost(&req) {
+                    return Box::pin(future::ok(Self::forbidden_not_localhost()));
                 }
+
+                let level = match self.tracing.level() {
+                    Some(level) => level.clone(),
+                    None => return Box::pin(future::ok(Self::not_found())),
+                };
+
+                Box::pin(log::level::serve(level, req).or_else(|error| {
+                    tracing::error!(error, "Failed to get/set tracing level");
+                    future::ok(Self::internal_error_rsp(error))
+                }))
             }
+
+            #[cfg(feature = "log-streaming")]
+            "/logs.json" => {
+                if !Self::client_is_localhost(&req) {
+                    return Box::pin(future::ok(Self::forbidden_not_localhost()));
+                }
+
+                Box::pin(
+                    log::stream::serve(self.tracing.clone(), req).or_else(|error| {
+                        tracing::error!(error, "Failed to stream logs");
+                        future::ok(Self::internal_error_rsp(error))
+                    }),
+                )
+            }
+
+            "/env.json" => Box::pin(future::ok(Self::env_rsp(req))),
+
             "/shutdown" => {
                 if req.method() == http::Method::POST {
                     if Self::client_is_localhost(&req) {
@@ -192,6 +263,27 @@ where
                     Box::pin(future::ok(Self::method_not_allowed()))
                 }
             }
+
+            #[cfg(feature = "pprof")]
+            "/debug/pprof/profile.pb.gz" if self.pprof.is_some() => {
+                let pprof = self.pprof.expect("unreachable");
+
+                if !Self::client_is_localhost(&req) {
+                    return Box::pin(future::ok(Self::forbidden_not_localhost()));
+                }
+
+                if req.method() != http::Method::GET {
+                    return Box::pin(future::ok(Self::method_not_allowed()));
+                }
+
+                Box::pin(async move {
+                    Ok(pprof
+                        .profile(req)
+                        .await
+                        .unwrap_or_else(Self::internal_error_rsp))
+                })
+            }
+
             _ => Box::pin(future::ok(Self::not_found())),
         }
     }
@@ -202,7 +294,7 @@ mod tests {
     use super::*;
     use http::method::Method;
     use std::time::Duration;
-    use tokio::{sync::mpsc, time::timeout};
+    use tokio::time::timeout;
     use tower::util::ServiceExt;
 
     const TIMEOUT: Duration = Duration::from_secs(1);

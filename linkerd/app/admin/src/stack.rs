@@ -7,7 +7,9 @@ use linkerd_app_core::{
     serve,
     svc::{self, ExtractParam, InsertParam, Param},
     tls, trace,
-    transport::{self, listen::Bind, ClientAddr, Local, OrigDstAddr, Remote, ServerAddr},
+    transport::{
+        self, addrs::AddrPair, listen::Bind, ClientAddr, Local, OrigDstAddr, Remote, ServerAddr,
+    },
     Error, Result,
 };
 use linkerd_app_inbound as inbound;
@@ -20,6 +22,8 @@ use tracing::debug;
 pub struct Config {
     pub server: ServerConfig,
     pub metrics_retain_idle: Duration,
+    #[cfg(feature = "pprof")]
+    pub enable_profiling: bool,
 }
 
 pub struct Task {
@@ -34,7 +38,7 @@ struct NonHttpClient(Remote<ClientAddr>);
 
 #[derive(Debug, Error)]
 #[error("Unexpected TLS connection to {} from {}", self.0, self.1)]
-struct UnexpectedSni(tls::ServerId, Remote<ClientAddr>);
+struct UnexpectedSni(tls::ServerName, Remote<ClientAddr>);
 
 #[derive(Clone, Debug)]
 struct Tcp {
@@ -52,7 +56,7 @@ struct Http {
 
 #[derive(Clone, Debug)]
 struct Permitted {
-    permit: inbound::policy::Permit,
+    permit: inbound::policy::HttpRoutePermit,
     http: Http,
 }
 
@@ -73,10 +77,10 @@ impl Config {
     pub fn build<B, R>(
         self,
         bind: B,
-        policy: impl inbound::policy::CheckPolicy,
+        policy: impl inbound::policy::GetPolicy,
         identity: identity::Server,
         report: R,
-        metrics: inbound::Metrics,
+        metrics: inbound::InboundMetrics,
         trace: trace::Handle,
         drain: drain::Watch,
         shutdown: mpsc::UnboundedSender<()>,
@@ -84,23 +88,52 @@ impl Config {
     where
         R: FmtMetrics + Clone + Send + Sync + Unpin + 'static,
         B: Bind<ServerConfig>,
-        B::Addrs: svc::Param<Remote<ClientAddr>> + svc::Param<Local<ServerAddr>>,
+        B::Addrs: svc::Param<Remote<ClientAddr>>,
+        B::Addrs: svc::Param<Local<ServerAddr>>,
+        B::Addrs: svc::Param<AddrPair>,
     {
         let (listen_addr, listen) = bind.bind(&self.server)?;
 
         // Get the policy for the admin server.
-        let policy = policy.check_policy(OrigDstAddr(listen_addr.into()))?;
+        let policy = policy.get_policy(OrigDstAddr(listen_addr.into()));
 
         let (ready, latch) = crate::server::Readiness::new();
+
+        #[cfg_attr(not(feature = "pprof"), allow(unused_mut))]
         let admin = crate::server::Admin::new(report, ready, shutdown, trace);
-        let admin = svc::stack(move |_| admin.clone())
-            .push(metrics.proxy.http_endpoint.to_layer::<classify::Response, _, Permitted>())
+
+        #[cfg(feature = "pprof")]
+        let admin = admin.with_profiling(self.enable_profiling);
+
+        let http = svc::stack(move |_| admin.clone())
+            .push(
+                metrics
+                    .proxy
+                    .http_endpoint
+                    .to_layer::<classify::Response, _, Permitted>(),
+            )
+            .push(classify::NewClassify::layer_default())
             .push_map_target(|(permit, http)| Permitted { permit, http })
-            .push(inbound::policy::NewAuthorizeHttp::layer(metrics.http_authz.clone()))
+            .push(inbound::policy::NewHttpPolicy::layer(
+                metrics.http_authz.clone(),
+            ))
             .push(Rescue::layer())
             .push_on_service(http::BoxResponse::layer())
-            .push(http::NewServeHttp::layer(Default::default(), drain.clone()))
-            .push_request_filter(
+            .arc_new_clone_http();
+
+        let tcp = http
+            .unlift_new()
+            .push(http::NewServeHttp::layer({
+                let drain = drain.clone();
+                move |t: &Http| {
+                    http::ServerParams {
+                        version: t.version,
+                        h2: Default::default(),
+                        drain: drain.clone(),
+                    }
+                }
+            }))
+            .push_filter(
                 |(http, tcp): (
                     Result<Option<http::Version>, detect::DetectTimeoutError<_>>,
                     Tcp,
@@ -115,7 +148,7 @@ impl Config {
                         // - If we received some unexpected SNI, the client is mostly likely
                         //   confused/stale.
                         Err(_timeout) => {
-                            let version = match tcp.tls.clone() {
+                            let version = match tcp.tls {
                                 tls::ConditionalServerTls::None(_) => http::Version::Http1,
                                 tls::ConditionalServerTls::Some(tls::ServerTls::Established {
                                     ..
@@ -127,7 +160,7 @@ impl Config {
                                     return Err(Error::from(UnexpectedSni(sni, tcp.client)));
                                 }
                             };
-                            debug!(%version, "HTTP detection timed out; assuming HTTP");
+                            debug!(?version, "HTTP detection timed out; assuming HTTP");
                             Ok(Http { version, tcp })
                         }
                         // If the connection failed HTTP detection, check if we detected TLS for
@@ -141,8 +174,11 @@ impl Config {
                     }
                 },
             )
-            .push(svc::ArcNewService::layer())
-            .push(detect::NewDetectService::layer(svc::stack::CloneParam::from(detect::Config::<http::DetectHttp>::from_timeout(DETECT_TIMEOUT))))
+            .arc_new_tcp()
+            .lift_new_with_target()
+            .push(detect::NewDetectService::layer(svc::stack::CloneParam::from(
+                detect::Config::<http::DetectHttp>::from_timeout(DETECT_TIMEOUT),
+            )))
             .push(transport::metrics::NewServer::layer(metrics.proxy.transport))
             .push_map_target(move |(tls, addrs): (tls::ConditionalServerTls, B::Addrs)| {
                 Tcp {
@@ -152,13 +188,14 @@ impl Config {
                     policy: policy.clone(),
                 }
             })
-            .push(svc::ArcNewService::layer())
+            .arc_new_tcp()
             .push(tls::NewDetectTls::<identity::Server, _, _>::layer(TlsParams {
                 identity,
             }))
+            .arc_new_tcp()
             .into_inner();
 
-        let serve = Box::pin(serve::serve(listen, admin, drain.signaled()));
+        let serve = Box::pin(serve::serve(listen, tcp, drain.signaled()));
         Ok(Task {
             listen_addr,
             latch,
@@ -196,6 +233,14 @@ impl Param<OrigDstAddr> for Http {
 impl Param<Remote<ClientAddr>> for Http {
     fn param(&self) -> Remote<ClientAddr> {
         self.tcp.client
+    }
+}
+
+impl Param<AddrPair> for Http {
+    fn param(&self) -> AddrPair {
+        let Remote(client) = self.tcp.client;
+        let Local(server) = self.tcp.addr;
+        AddrPair(client, server)
     }
 }
 
@@ -291,12 +336,15 @@ impl<T: Param<tls::ConditionalServerTls>> ExtractParam<errors::respond::EmitHead
 
 impl errors::HttpRescue<Error> for Rescue {
     fn rescue(&self, error: Error) -> Result<errors::SyntheticHttpResponse> {
-        let cause = errors::root_cause(&*error);
-        if cause.is::<inbound::policy::DeniedUnauthorized>() {
-            return Ok(errors::SyntheticHttpResponse::permission_denied(error));
+        if let Some(cause) = errors::cause_ref::<inbound::policy::HttpRouteNotFound>(&*error) {
+            return Ok(errors::SyntheticHttpResponse::not_found(cause));
         }
 
-        tracing::warn!(%error, "Unexpected error");
+        if let Some(cause) = errors::cause_ref::<inbound::policy::HttpRouteUnauthorized>(&*error) {
+            return Ok(errors::SyntheticHttpResponse::permission_denied(cause));
+        }
+
+        tracing::warn!(error, "Unexpected error");
         Ok(errors::SyntheticHttpResponse::unexpected_error())
     }
 }

@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::fmt;
-use std::string::ToString;
 
 #[derive(Debug, Clone)]
 pub struct MetricMatch {
@@ -70,7 +69,7 @@ impl MetricMatch {
         let num_expected_labels = self.labels.len();
 
         for &metric in &metrics {
-            let span = tracing::debug_span!("checking", ?metric);
+            let span = tracing::debug_span!("checking", ?metric).or_current();
             let _e = span.enter();
             // Count the number of expected labels matched in this metric, so
             // that we can ensure all expected labels were found.
@@ -192,7 +191,6 @@ impl MetricMatch {
         Ok(())
     }
 
-    #[track_caller]
     pub async fn assert_in(&self, client: &crate::client::Client) {
         use std::str::FromStr;
         use std::{env, u64};
@@ -254,7 +252,7 @@ impl Labels {
     /// the values from `other` overwrite the values in `self`.
     pub fn and(&self, other: Labels) -> Labels {
         let mut new_labels = self.0.clone();
-        new_labels.extend(other.0.into_iter());
+        new_labels.extend(other.0);
         Labels(new_labels)
     }
 

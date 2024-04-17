@@ -1,356 +1,372 @@
-use crate::{tcp, Outbound};
-use linkerd_app_core::{
-    io, profiles,
-    svc::{self, stack::Param},
-    transport::{self, metrics::SensorIo, OrigDstAddr},
-    Error,
+use crate::{
+    policy::{self, ClientPolicy},
+    Outbound,
 };
-use std::convert::TryFrom;
-use tracing::{debug, debug_span, info_span};
+use linkerd_app_core::{errors, profiles, svc, transport::OrigDstAddr, Error};
+use once_cell::sync::Lazy;
+use std::{
+    fmt::Debug,
+    hash::{Hash, Hasher},
+    net::SocketAddr,
+    ops::Deref,
+    sync::Arc,
+    time::Duration,
+};
+use tokio::sync::watch;
+use tracing::Instrument;
+
+#[cfg(test)]
+mod tests;
+
+/// Target with a discovery result.
+#[derive(Clone, Debug)]
+pub struct Discovery<T> {
+    parent: T,
+    profile: Option<profiles::Receiver>,
+    policy: policy::Receiver,
+}
 
 impl<N> Outbound<N> {
-    /// Discovers the profile for a TCP endpoint.
-    ///
-    /// Resolved services are cached and buffered.
-    pub fn push_discover<T, I, NSvc, P>(
+    /// Discovers routing configuration.
+    pub fn push_discover<T, K, Req, NSvc, D>(
         self,
-        profiles: P,
-    ) -> Outbound<
-        svc::ArcNewService<
-            T,
-            impl svc::Service<I, Response = (), Error = Error, Future = impl Send> + Clone,
-        >,
-    >
+        discover: D,
+    ) -> Outbound<svc::ArcNewService<T, svc::BoxService<Req, NSvc::Response, Error>>>
     where
-        T: Param<OrigDstAddr>,
-        I: io::AsyncRead + io::AsyncWrite + io::PeerAddr + std::fmt::Debug + Send + Unpin + 'static,
-        N: svc::NewService<(Option<profiles::Receiver>, tcp::Accept), Service = NSvc>
-            + Clone
-            + Send
-            + Sync
-            + 'static,
-        NSvc: svc::Service<SensorIo<I>, Response = (), Error = Error> + Send + 'static,
+        // Discoverable target.
+        T: svc::Param<K>,
+        T: Clone + Send + Sync + 'static,
+        K: Clone + Debug + Eq + Hash + Send + Sync + 'static,
+        // Request type.
+        Req: Send + 'static,
+        // Discovery client.
+        D: svc::Service<K, Error = Error> + Clone + Send + Sync + 'static,
+        D::Future: Send + Unpin + 'static,
+        D::Error: Send + Sync + 'static,
+        D::Response: Clone + Send + Sync + 'static,
+        Discovery<T>: From<(D::Response, T)>,
+        // Inner stack.
+        N: svc::NewService<Discovery<T>, Service = NSvc>,
+        N: Clone + Send + Sync + 'static,
+        NSvc: svc::Service<Req, Error = Error> + Send + 'static,
         NSvc::Future: Send,
-        P: profiles::GetProfile<profiles::LookupAddr> + Clone + Send + Sync + 'static,
-        P::Future: Send,
-        P::Error: Send,
     {
-        self.map_stack(|config, rt, accept| {
-            let allow = config.allow_discovery.clone();
-            accept
-                .push(profiles::discover::layer(
-                    profiles,
-                    move |a: tcp::Accept| {
-                        let OrigDstAddr(addr) = a.orig_dst;
-                        if allow.matches_ip(addr.ip()) {
-                            debug!("Allowing profile lookup");
-                            Ok(profiles::LookupAddr(addr.into()))
-                        } else {
-                            tracing::debug!(
-                                %addr,
-                                networks = %allow.nets(),
-                                "Profile discovery not in configured search networks",
-                            );
-                            Err(profiles::DiscoveryRejected::new(
-                                "not in configured search networks",
-                            ))
-                        }
-                    },
-                ))
-                .instrument(|_: &_| debug_span!("profile"))
-                .push_on_service(
-                    svc::layers()
-                        // If the traffic split is empty/unavailable, eagerly fail
-                        // requests. When the split is in failfast, spawn the
-                        // service in a background task so it becomes ready without
-                        // new requests.
-                        .push(svc::layer::mk(svc::SpawnReady::new))
-                        .push(
-                            rt.metrics
-                                .proxy
-                                .stack
-                                .layer(crate::stack_labels("tcp", "server")),
-                        )
-                        .push(svc::FailFast::layer(
-                            "TCP Server",
-                            config.proxy.dispatch_timeout,
-                        ))
-                        .push_spawn_buffer(config.proxy.buffer_capacity),
-                )
-                .push(transport::metrics::NewServer::layer(
-                    rt.metrics.proxy.transport.clone(),
-                ))
-                .push_cache(config.proxy.cache_max_idle_age)
-                .instrument(|a: &tcp::Accept| info_span!("server", orig_dst = %a.orig_dst))
-                .push_request_filter(|t: T| tcp::Accept::try_from(t.param()))
-                .push(rt.metrics.tcp_errors.to_layer())
-                .push(svc::ArcNewService::layer())
-                .check_new_service::<T, I>()
+        self.map_stack(|config, _, stk| {
+            stk.lift_new_with_target()
+                .push_new_cached_discover(discover, config.discovery_idle_timeout)
+                .check_new_service::<T, _>()
+                .arc_new_box()
+        })
+    }
+
+    pub(crate) fn resolver(
+        &self,
+        profiles: impl profiles::GetProfile<Error = Error>,
+        policies: impl policy::GetPolicy,
+    ) -> impl svc::Service<
+        OrigDstAddr,
+        Error = Error,
+        Response = (Option<profiles::Receiver>, policy::Receiver),
+        Future = impl Send,
+    > + Clone
+           + Send
+           + Sync
+           + 'static {
+        let detect_timeout = self.config.proxy.detect_protocol_timeout;
+        let queue = {
+            let queue = self.config.tcp_connection_queue;
+            policy::Queue {
+                capacity: queue.capacity,
+                failfast_timeout: queue.failfast_timeout,
+            }
+        };
+        svc::mk(move |OrigDstAddr(orig_dst)| {
+            tracing::debug!(addr = %orig_dst, "Discover");
+
+            let profile = profiles
+                .clone()
+                .get_profile(profiles::LookupAddr(orig_dst.into()))
+                .instrument(tracing::debug_span!("profiles").or_current());
+            let policy = policies
+                .get_policy(orig_dst.into())
+                .instrument(tracing::debug_span!("policy").or_current());
+
+            Box::pin(async move {
+                let (profile, policy) = tokio::join!(profile, policy);
+                tracing::debug!("Discovered");
+
+                let profile = profile.unwrap_or_else(|error| {
+                    tracing::warn!(%error, "Error resolving ServiceProfile");
+                    None
+                });
+
+                // If there was a policy resolution, return it with the profile so
+                // the stack can determine how to switch on them.
+                match policy {
+                    Ok(policy) => return Ok((profile, policy)),
+                    // XXX(ver) The policy controller may (for the time being) reject
+                    // our lookups, since it doesn't yet serve endpoint metadata for
+                    // forwarding.
+                    Err(error) if errors::has_grpc_status(&error, tonic::Code::NotFound) => tracing::debug!("Policy not found"),
+                    // Earlier versions of the Linkerd control plane (e.g.
+                    // 2.12.x) will return `Unimplemented` for requests to the
+                    // OutboundPolicy API. Log a warning and synthesize a policy
+                    // for backwards compatibility.
+                    Err(error) if errors::has_grpc_status(&error, tonic::Code::Unimplemented) =>
+                        tracing::warn!("Policy controller returned `Unimplemented`, the control plane may be out of date."),
+                    Err(error) => return Err(error),
+                }
+
+                // If there was a profile resolution, try to use it to synthesize a
+                // enpdoint policy.
+                if let Some(profile) = profile {
+                    let policy = spawn_synthesized_profile_policy(
+                        profile.clone().into(),
+                        move |profile: &profiles::Profile| {
+                            static META: Lazy<Arc<policy::Meta>> = Lazy::new(|| {
+                                Arc::new(policy::Meta::Default {
+                                    name: "endpoint".into(),
+                                })
+                            });
+                            let (addr, meta) = profile
+                                .endpoint
+                                .clone()
+                                .unwrap_or_else(|| (orig_dst, Default::default()));
+                            // TODO(ver) We should be able to figure out resource coordinates for
+                            // the endpoint?
+                            synthesize_forward_policy(&META, detect_timeout, queue, addr, meta)
+                        },
+                    );
+                    return Ok((Some(profile), policy));
+                }
+
+                // Otherwise, route the request to the original destination address.
+                let policy = spawn_synthesized_origdst_policy(orig_dst, queue, detect_timeout);
+                Ok((None, policy))
+            })
         })
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::test_util::*;
-    use linkerd_app_core::{
-        svc::{NewService, Service, ServiceExt},
-        AddrMatch, IpNet,
-    };
-    use std::{
-        net::{IpAddr, SocketAddr},
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc,
+pub fn spawn_synthesized_profile_policy(
+    mut profile: watch::Receiver<profiles::Profile>,
+    synthesize: impl Fn(&profiles::Profile) -> policy::ClientPolicy + Send + 'static,
+) -> watch::Receiver<policy::ClientPolicy> {
+    let policy = synthesize(&profile.borrow_and_update());
+    tracing::debug!(?policy, profile = ?*profile.borrow(), "Synthesizing policy from profile");
+    let (tx, rx) = watch::channel(policy);
+    tokio::spawn(
+        async move {
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = tx.closed() => {
+                        tracing::debug!("Policy watch closed; terminating");
+                        return;
+                    }
+                    res = profile.changed() => {
+                        if res.is_err() {
+                            tracing::debug!("Profile watch closed; terminating");
+                            return;
+                        }
+                    }
+                };
+                let policy = synthesize(&profile.borrow());
+                tracing::debug!(?policy, "Profile updated; synthesizing policy");
+                if tx.send(policy).is_err() {
+                    tracing::debug!("Policy watch closed, terminating");
+                    return;
+                }
+            }
+        }
+        .in_current_span(),
+    );
+    rx
+}
+
+pub fn synthesize_forward_policy(
+    meta: &Arc<policy::Meta>,
+    timeout: Duration,
+    queue: policy::Queue,
+    addr: SocketAddr,
+    metadata: policy::EndpointMetadata,
+) -> ClientPolicy {
+    policy_for_backend(
+        meta,
+        timeout,
+        policy::Backend {
+            meta: meta.clone(),
+            queue,
+            dispatcher: policy::BackendDispatcher::Forward(addr, metadata),
         },
+    )
+}
+
+pub fn synthesize_balance_policy(
+    meta: &Arc<policy::Meta>,
+    timeout: Duration,
+    queue: policy::Queue,
+    load: policy::Load,
+    addr: impl ToString,
+) -> ClientPolicy {
+    policy_for_backend(
+        meta,
+        timeout,
+        policy::Backend {
+            meta: meta.clone(),
+            queue,
+            dispatcher: policy::BackendDispatcher::BalanceP2c(
+                load,
+                policy::EndpointDiscovery::DestinationGet {
+                    path: addr.to_string(),
+                },
+            ),
+        },
+    )
+}
+
+fn policy_for_backend(
+    meta: &Arc<policy::Meta>,
+    timeout: Duration,
+    backend: policy::Backend,
+) -> ClientPolicy {
+    static NO_HTTP_FILTERS: Lazy<Arc<[policy::http::Filter]>> = Lazy::new(|| Arc::new([]));
+    static NO_OPAQ_FILTERS: Lazy<Arc<[policy::opaq::Filter]>> = Lazy::new(|| Arc::new([]));
+
+    let opaque = policy::opaq::Opaque {
+        policy: Some(policy::opaq::Policy {
+            meta: meta.clone(),
+            filters: NO_OPAQ_FILTERS.clone(),
+            failure_policy: Default::default(),
+            request_timeout: None,
+            distribution: policy::RouteDistribution::FirstAvailable(Arc::new([
+                policy::RouteBackend {
+                    filters: NO_OPAQ_FILTERS.clone(),
+                    backend: backend.clone(),
+                    request_timeout: None,
+                },
+            ])),
+        }),
     };
-    use tokio::time;
 
-    /// Tests that the discover stack propagates errors to the caller.
-    #[tokio::test(flavor = "current_thread")]
-    async fn errors_propagate() {
-        let _trace = linkerd_tracing::test::trace_init();
-        time::pause(); // Run the test with a mocked clock.
+    let routes = Arc::new([policy::http::Route {
+        hosts: vec![],
+        rules: vec![policy::http::Rule {
+            matches: vec![policy::http::r#match::MatchRequest::default()],
+            policy: policy::http::Policy {
+                meta: meta.clone(),
+                filters: NO_HTTP_FILTERS.clone(),
+                failure_policy: Default::default(),
+                request_timeout: None,
+                distribution: policy::RouteDistribution::FirstAvailable(Arc::new([
+                    policy::RouteBackend {
+                        filters: NO_HTTP_FILTERS.clone(),
+                        backend: backend.clone(),
+                        request_timeout: None,
+                    },
+                ])),
+            },
+        }],
+    }]);
 
-        let addr = SocketAddr::new([192, 0, 2, 22].into(), 2220);
+    let detect = policy::Protocol::Detect {
+        timeout,
+        http1: policy::http::Http1 {
+            routes: routes.clone(),
+            failure_accrual: Default::default(),
+        },
+        http2: policy::http::Http2 {
+            routes,
+            failure_accrual: Default::default(),
+        },
+        opaque,
+    };
 
-        // Mock an inner stack with a service that fails, tracking the number of services built &
-        // held.
-        let new_count = Arc::new(AtomicUsize::new(0));
-        let (handle, stack) = {
-            let new_count = new_count.clone();
-            support::track::new_service(move |_| {
-                new_count.fetch_add(1, Ordering::SeqCst);
-                svc::mk(move |_: SensorIo<io::DuplexStream>| {
-                    future::err::<(), Error>(
-                        io::Error::from(io::ErrorKind::ConnectionRefused).into(),
-                    )
-                })
-            })
-        };
-
-        let profiles = support::profile::resolver().profile(addr, profiles::Profile::default());
-
-        // Create a profile stack that uses the tracked inner stack.
-        let (rt, _shutdown) = runtime();
-        let stack = Outbound::new(default_config(), rt)
-            .with_stack(stack)
-            .push_discover(profiles)
-            .into_inner();
-
-        assert_eq!(
-            new_count.load(Ordering::SeqCst),
-            0,
-            "no services have been created yet"
-        );
-        assert_eq!(
-            handle.tracked_services(),
-            0,
-            "no services have been created yet"
-        );
-
-        // Instantiate a service from the stack so that it instantiates the tracked inner service.
-        //
-        // The discover stack's buffer does not drive profile resolution (or the inner service)
-        // until the service is called?! So we drive this all on a background ask that gets canceled
-        // to drop the service reference.
-        let svc = stack.new_service(tcp::Accept::from(OrigDstAddr(addr)));
-        let task = spawn_conn(svc);
-        // We have to let some time pass for the buffer to drive the profile to readiness.
-        time::advance(time::Duration::from_millis(100)).await;
-        assert_eq!(
-            new_count.load(Ordering::SeqCst),
-            1,
-            "exactly one service has been created"
-        );
-        assert_eq!(
-            handle.tracked_services(),
-            1,
-            "there should be exactly one service"
-        );
-
-        task.await.unwrap().expect_err("service must fail");
+    ClientPolicy {
+        parent: meta.clone(),
+        protocol: detect,
+        backends: Arc::new([backend]),
     }
+}
 
-    /// Tests that the discover stack caches resolutions for each unique destination address.
-    ///
-    /// This test obtains a service, drops it obtains the service again, and then drops it again,
-    /// testing that only one service is built and that it is dropped after an idle timeout.
-    #[tokio::test(flavor = "current_thread")]
-    async fn caches_profiles_until_idle() {
-        let _trace = linkerd_tracing::test::trace_init();
-        time::pause(); // Run the test with a mocked clock.
-
-        let addr = SocketAddr::new([192, 0, 2, 22].into(), 5550);
-        let idle_timeout = time::Duration::from_secs(1);
-        let sleep_time = idle_timeout + time::Duration::from_millis(1);
-
-        // Mock an inner stack with a service that never returns, tracking the number of services
-        // built & held.
-        let new_count = Arc::new(AtomicUsize::new(0));
-        let (handle, stack) = {
-            let new_count = new_count.clone();
-            support::track::new_service(move |_| {
-                new_count.fetch_add(1, Ordering::SeqCst);
-                svc::mk(move |_: SensorIo<io::DuplexStream>| future::pending::<Result<(), Error>>())
-            })
-        };
-
-        let profiles = support::profile::resolver().profile(addr, profiles::Profile::default());
-
-        // Create a profile stack that uses the tracked inner stack, configured to drop cached
-        // service after `idle_timeout`.
-        let cfg = {
-            let mut cfg = default_config();
-            cfg.proxy.cache_max_idle_age = idle_timeout;
-            cfg
-        };
-        let (rt, _shutdown) = runtime();
-        let stack = Outbound::new(cfg, rt)
-            .with_stack(stack)
-            .push_discover(profiles)
-            .into_inner();
-
-        assert_eq!(
-            new_count.load(Ordering::SeqCst),
-            0,
-            "no services have been created yet"
-        );
-        assert_eq!(
-            handle.tracked_services(),
-            0,
-            "no services have been created yet"
-        );
-
-        // Instantiate a service from the stack so that it instantiates the tracked inner service.
-        //
-        // The discover stack's buffer does not drive profile resolution (or the inner service)
-        // until the service is called?! So we drive this all on a background ask that gets canceled
-        // to drop the service reference.
-        let svc0 = stack.new_service(tcp::Accept::from(OrigDstAddr(addr)));
-        let task0 = spawn_conn(svc0);
-        // We have to let some time pass for the buffer to drive the profile to readiness.
-        time::advance(time::Duration::from_millis(100)).await;
-        assert_eq!(
-            new_count.load(Ordering::SeqCst),
-            1,
-            "exactly one service has been created"
-        );
-        assert_eq!(
-            handle.tracked_services(),
-            1,
-            "there should be exactly one service"
-        );
-
-        // Abort the pending task (simulating a disconnect from a client) and obtain the cached
-        // service from the stack.
-        task0.abort();
-        let svc1 = stack.new_service(tcp::Accept::from(OrigDstAddr(addr)));
-        let task1 = spawn_conn(svc1);
-        // Let some time pass and ensure the service hasn't been dropped from the stack (because the
-        // task is still running).
-        time::sleep(sleep_time).await;
-        assert_eq!(
-            new_count.load(Ordering::SeqCst),
-            1,
-            "only one service has been created"
-        );
-        assert_eq!(
-            handle.tracked_services(),
-            1,
-            "the service should be retained"
-        );
-
-        // Cancel the task and ensure the cached service is dropped after the idle timeout expires.
-        task1.abort();
-        assert_eq!(
-            handle.tracked_services(),
-            1,
-            "the service should be retained for an idle timeout"
-        );
-        time::sleep(sleep_time).await;
-        assert_eq!(
-            handle.tracked_services(),
-            0,
-            "the service should have been dropped"
-        );
-
-        // When another stack is built for the same target, we create a new service (because the
-        // prior service has been idled out).
-        let svc2 = stack.new_service(tcp::Accept::from(OrigDstAddr(addr)));
-        let task2 = spawn_conn(svc2);
-        // We have to let some time pass for the buffer to drive the profile to readiness.
-        time::advance(time::Duration::from_millis(100)).await;
-        assert_eq!(
-            new_count.load(Ordering::SeqCst),
-            2,
-            "exactly two services should be created"
-        );
-        assert_eq!(handle.tracked_services(), 1, "the service should be active");
-        task2.abort();
-        time::sleep(sleep_time).await;
-        assert_eq!(
-            handle.tracked_services(),
-            0,
-            "the service should have been dropped"
-        );
-    }
-
-    /// Tests that the discover stack avoids resolutions when the stack is not configured to permit
-    /// resolutions.
-    #[tokio::test(flavor = "current_thread")]
-    async fn no_profiles_when_outside_search_nets() {
-        let _trace = linkerd_tracing::test::trace_init();
-
-        let addr = SocketAddr::new([192, 0, 2, 22].into(), 2222);
-
-        // XXX we should assert that the resolver isn't even invoked, but the mocked resolver
-        // doesn't support that right now. So, instead, we return a profile for resolutions to
-        // and assert (below) that no profile is provided.
-        let profiles = support::profile::resolver().profile(addr, profiles::Profile::default());
-
-        // Mock an inner stack with a service that asserts that no profile is built.
-        let stack = |(profile, _): (Option<profiles::Receiver>, _)| {
-            assert!(profile.is_none(), "profile must not resolve");
-            svc::mk(move |_: SensorIo<io::DuplexStream>| future::ok::<(), Error>(()))
-        };
-
-        // Create a profile stack that uses the tracked inner stack, configured to never actually do
-        // profile resolutions for the IP being tested.
-
-        let cfg = {
-            let mut cfg = default_config();
-            // Permits resolutions for only 192.0.2.66/32.
-            cfg.allow_discovery =
-                AddrMatch::new(None, Some(IpNet::from(IpAddr::from([192, 0, 2, 66]))));
-            cfg
-        };
-        let (rt, _shutdown) = runtime();
-        let stack = Outbound::new(cfg, rt)
-            .with_stack(stack)
-            .push_discover(profiles)
-            .into_inner();
-
-        // Instantiate a service from the stack so that it instantiates the tracked inner service.
-        //
-        // The discover stack's buffer does not drive profile resolution (or the inner service)
-        // until the service is called?! So we drive this all on a background ask that gets canceled
-        // to drop the service reference.
-        let svc = stack.new_service(tcp::Accept::from(OrigDstAddr(addr)));
-        spawn_conn(svc).await.unwrap().expect("must not fail");
-    }
-
-    fn spawn_conn<S>(mut svc: S) -> tokio::task::JoinHandle<Result<(), Error>>
-    where
-        S: Service<io::DuplexStream, Response = (), Error = Error> + Send + 'static,
-        S::Future: Send,
-    {
-        tokio::spawn(async move {
-            let (server_io, _client_io) = io::duplex(1);
-            svc.ready().await?.call(server_io).await?;
-            drop(svc);
-            Ok(())
+fn spawn_synthesized_origdst_policy(
+    orig_dst: SocketAddr,
+    queue: policy::Queue,
+    detect_timeout: Duration,
+) -> watch::Receiver<policy::ClientPolicy> {
+    static META: Lazy<Arc<policy::Meta>> = Lazy::new(|| {
+        Arc::new(policy::Meta::Default {
+            name: "fallback".into(),
         })
+    });
+
+    let policy =
+        synthesize_forward_policy(&META, detect_timeout, queue, orig_dst, Default::default());
+    tracing::debug!(?policy, "Synthesizing policy");
+    let (tx, rx) = watch::channel(policy);
+    tokio::spawn(async move {
+        tx.closed().await;
+    });
+    rx
+}
+
+// === impl Discovery ===
+
+impl<T> From<((Option<profiles::Receiver>, policy::Receiver), T)> for Discovery<T> {
+    fn from(
+        // whew!
+        ((profile, policy), parent): ((Option<profiles::Receiver>, policy::Receiver), T),
+    ) -> Self {
+        Self {
+            parent,
+            profile,
+            policy,
+        }
+    }
+}
+
+impl<T> svc::Param<Option<profiles::Receiver>> for Discovery<T> {
+    fn param(&self) -> Option<profiles::Receiver> {
+        self.profile.clone()
+    }
+}
+
+impl<T> svc::Param<Option<watch::Receiver<profiles::Profile>>> for Discovery<T> {
+    fn param(&self) -> Option<watch::Receiver<profiles::Profile>> {
+        self.profile.clone().map(Into::into)
+    }
+}
+
+impl<T> svc::Param<Option<profiles::LogicalAddr>> for Discovery<T> {
+    fn param(&self) -> Option<profiles::LogicalAddr> {
+        self.profile.as_ref().and_then(|p| p.logical_addr())
+    }
+}
+
+impl<T> svc::Param<policy::Receiver> for Discovery<T> {
+    fn param(&self) -> policy::Receiver {
+        self.policy.clone()
+    }
+}
+
+impl<T> Deref for Discovery<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.parent
+    }
+}
+
+impl<T: PartialEq> PartialEq for Discovery<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.parent == other.parent
+    }
+}
+
+impl<T: Eq> Eq for Discovery<T> {}
+
+impl<T: Hash> Hash for Discovery<T> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.parent.hash(state);
     }
 }

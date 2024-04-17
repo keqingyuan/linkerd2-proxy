@@ -3,7 +3,6 @@
 //! This module uses unsafe code to implement [`BufMut`].
 
 #![deny(
-    warnings,
     rust_2018_idioms,
     clippy::disallowed_methods,
     clippy::disallowed_types,
@@ -49,12 +48,14 @@ struct CopyBuf {
     write_pos: usize,
 }
 
+#[allow(dead_code)]
 enum Buffered {
     NotEmpty,
     Read(usize),
     Eof,
 }
 
+#[allow(dead_code)]
 enum Drained {
     BufferEmpty,
     Partial(usize),

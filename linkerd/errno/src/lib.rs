@@ -1,9 +1,4 @@
-#![deny(
-    warnings,
-    rust_2018_idioms,
-    clippy::disallowed_methods,
-    clippy::disallowed_types
-)]
+#![deny(rust_2018_idioms, clippy::disallowed_methods, clippy::disallowed_types)]
 #![forbid(unsafe_code)]
 
 use std::fmt;
@@ -49,7 +44,7 @@ mod code {
                 }
             }
 
-            impl<'a> From<$from_ty> for $name {
+            impl From<$from_ty> for $name {
                 fn from(err: $from_ty) -> Self {
                     match err {
                         $(

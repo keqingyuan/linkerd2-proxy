@@ -18,7 +18,11 @@ use std::sync::{
 };
 use std::task::{Context, Poll};
 use tokio::sync::{mpsc, watch};
-use tokio_stream::wrappers::UnboundedReceiverStream;
+
+#[cfg(feature = "client-policy")]
+mod client_policy;
+#[cfg(feature = "client-policy")]
+pub use self::client_policy::*;
 
 #[derive(Debug)]
 pub struct Resolver<A, E> {
@@ -57,7 +61,8 @@ struct State<A, E> {
     only: AtomicBool,
 }
 
-pub type DstReceiver<E> = UnboundedReceiverStream<Result<Update<E>, Error>>;
+#[pin_project::pin_project]
+pub struct DstReceiver<T>(#[pin] mpsc::UnboundedReceiver<Result<Update<T>, Error>>);
 
 #[derive(Debug)]
 pub struct SendFailed(());
@@ -101,7 +106,7 @@ impl<E> Dst<E> {
         self.state
             .endpoints
             .lock()
-            .insert(addr.into(), UnboundedReceiverStream::new(rx));
+            .insert(addr.into(), DstReceiver(rx));
         DstSender(tx)
     }
 
@@ -141,7 +146,7 @@ impl<T: Param<ConcreteAddr>, E> tower::Service<T> for Dst<E> {
                 self.state.only.store(false, Ordering::Release);
                 let (tx, rx) = mpsc::unbounded_channel();
                 let _ = tx.send(Ok(Update::DoesNotExist));
-                UnboundedReceiverStream::new(rx)
+                DstReceiver(rx)
             });
 
         future::ok(res)
@@ -174,6 +179,26 @@ impl Profiles {
         self.state.endpoints.lock().insert(addr.into(), None);
         self
     }
+
+    fn resolve(&self, addr: Addr) -> Option<profiles::Receiver> {
+        let span = tracing::trace_span!("mock_profile", ?addr);
+        let _e = span.enter();
+
+        self.state
+            .endpoints
+            .lock()
+            .remove(&addr)
+            .map(|x| {
+                tracing::trace!("found endpoint for addr");
+                x
+            })
+            .unwrap_or_else(|| {
+                tracing::debug!(?addr, "no endpoint configured for");
+                // An unknown endpoint was resolved!
+                self.state.only.store(false, Ordering::Release);
+                None
+            })
+    }
 }
 
 impl<T: Param<profiles::LookupAddr>> tower::Service<T> for Profiles {
@@ -187,28 +212,10 @@ impl<T: Param<profiles::LookupAddr>> tower::Service<T> for Profiles {
 
     fn call(&mut self, t: T) -> Self::Future {
         let profiles::LookupAddr(addr) = t.param();
-        let span = tracing::trace_span!("mock_profile", ?addr);
-        let _e = span.enter();
-
-        let res = self
-            .state
-            .endpoints
-            .lock()
-            .remove(&addr)
-            .map(|x| {
-                tracing::trace!("found endpoint for addr");
-                x
-            })
-            .unwrap_or_else(|| {
-                tracing::debug!(?addr, "no endpoint configured for");
-                // An unknown endpoint was resolved!
-                self.state.only.store(false, Ordering::Release);
-                None
-            });
-
-        future::ok(res)
+        future::ok(self.resolve(addr))
     }
 }
+
 // === impl Sender ===
 
 impl<E> DstSender<E> {
@@ -295,5 +302,19 @@ impl<T: Param<profiles::LookupAddr>> tower::Service<T> for NoProfiles {
             "no profile resolutions were expected in this test, but tried to resolve {}",
             addr
         );
+    }
+}
+
+impl<T> futures::Stream for DstReceiver<T> {
+    type Item = Result<Update<T>, Error>;
+
+    fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        match futures::ready!(this.0.poll_recv(cx)) {
+            Some(item) => Poll::Ready(Some(item)),
+            // If the stream terminates, the balancer will error, so we simply
+            // stop updating when the sender is closed.
+            None => Poll::Pending,
+        }
     }
 }

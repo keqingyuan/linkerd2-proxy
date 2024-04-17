@@ -1,100 +1,95 @@
 use crate::{
-    self as http,
-    client_handle::SetClientHandle,
-    glue::{HyperServerSvc, UpgradeBody},
-    h2::Settings as H2Settings,
-    trace, upgrade, Version,
+    client_handle::SetClientHandle, h2::Settings as H2Settings, upgrade, BoxBody, BoxRequest,
+    ClientHandle, TracingExecutor, Version,
 };
 use linkerd_error::Error;
 use linkerd_io::{self as io, PeerAddr};
-use linkerd_stack::{layer, NewService, Param};
+use linkerd_stack::{layer, ExtractParam, NewService};
 use std::{
     future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
 use tower::Service;
-use tracing::debug;
+use tracing::{debug, Instrument};
 
-type Server = hyper::server::conn::Http<trace::Executor>;
+#[cfg(test)]
+mod tests;
 
+/// Configures HTTP server behavior.
 #[derive(Clone, Debug)]
-pub struct NewServeHttp<N> {
-    inner: N,
-    server: Server,
-    drain: drain::Watch,
+pub struct Params {
+    pub version: Version,
+    pub h2: H2Settings,
+    pub drain: drain::Watch,
 }
 
+// A stack that builds HTTP servers.
 #[derive(Clone, Debug)]
-pub struct ServeHttp<S> {
+pub struct NewServeHttp<X, N> {
+    inner: N,
+    params: X,
+}
+
+/// Serves HTTP connectionswith an inner service.
+#[derive(Clone, Debug)]
+pub struct ServeHttp<N> {
     version: Version,
-    server: Server,
-    inner: S,
+    server: hyper::server::conn::Http<TracingExecutor>,
+    inner: N,
     drain: drain::Watch,
 }
 
 // === impl NewServeHttp ===
 
-impl<N> NewServeHttp<N> {
-    pub fn layer(
-        h2: H2Settings,
-        drain: drain::Watch,
-    ) -> impl layer::Layer<N, Service = Self> + Clone {
-        layer::mk(move |inner| Self::new(h2, inner, drain.clone()))
+impl<X: Clone, N> NewServeHttp<X, N> {
+    pub fn layer(params: X) -> impl layer::Layer<N, Service = Self> + Clone {
+        layer::mk(move |inner| Self::new(params.clone(), inner))
     }
 
     /// Creates a new `ServeHttp`.
-    fn new(h2: H2Settings, inner: N, drain: drain::Watch) -> Self {
-        let mut server = hyper::server::conn::Http::new().with_executor(trace::Executor::new());
-        server
-            .http2_initial_stream_window_size(h2.initial_stream_window_size)
-            .http2_initial_connection_window_size(h2.initial_connection_window_size);
-
-        // Configure HTTP/2 PING frames
-        if let Some(timeout) = h2.keepalive_timeout {
-            // XXX(eliza): is this a reasonable interval between
-            // PING frames?
-            let interval = timeout / 4;
-            server
-                .http2_keep_alive_timeout(timeout)
-                .http2_keep_alive_interval(interval);
-        }
-
-        Self {
-            inner,
-            server,
-            drain,
-        }
+    fn new(params: X, inner: N) -> Self {
+        Self { inner, params }
     }
 }
 
-impl<T, N> NewService<T> for NewServeHttp<N>
+impl<T, X, N> NewService<T> for NewServeHttp<X, N>
 where
-    T: Param<Version>,
+    X: ExtractParam<Params, T>,
     N: NewService<T> + Clone,
 {
     type Service = ServeHttp<N::Service>;
 
     fn new_service(&self, target: T) -> Self::Service {
-        let version = target.param();
+        let Params { version, h2, drain } = self.params.extract_param(&target);
+
+        let mut srv = hyper::server::conn::Http::new().with_executor(TracingExecutor);
+        srv.http2_initial_stream_window_size(h2.initial_stream_window_size)
+            .http2_initial_connection_window_size(h2.initial_connection_window_size);
+        // Configure HTTP/2 PING frames
+        if let Some(timeout) = h2.keepalive_timeout {
+            srv.http2_keep_alive_timeout(timeout)
+                .http2_keep_alive_interval(timeout / 4);
+        }
+
         debug!(?version, "Creating HTTP service");
         let inner = self.inner.new_service(target);
         ServeHttp {
             inner,
             version,
-            server: self.server.clone(),
-            drain: self.drain.clone(),
+            drain,
+            server: srv,
         }
     }
 }
 
 // === impl ServeHttp ===
 
-impl<I, S> Service<I> for ServeHttp<S>
+impl<I, N, S> Service<I> for ServeHttp<N>
 where
     I: io::AsyncRead + io::AsyncWrite + PeerAddr + Send + Unpin + 'static,
-    S: Service<http::Request<UpgradeBody>, Response = http::Response<http::BoxBody>, Error = Error>
-        + Clone
+    N: NewService<ClientHandle, Service = S> + Send + 'static,
+    S: Service<http::Request<BoxBody>, Response = http::Response<BoxBody>, Error = Error>
         + Unpin
         + Send
         + 'static,
@@ -109,64 +104,74 @@ where
     }
 
     fn call(&mut self, io: I) -> Self::Future {
-        let Self {
-            version,
-            inner,
-            drain,
-            mut server,
-        } = self.clone();
-        debug!(?version, "Handling as HTTP");
+        let version = self.version;
+        let drain = self.drain.clone();
+        let mut server = self.server.clone();
 
-        Box::pin(async move {
-            let (svc, closed) = SetClientHandle::new(io.peer_addr()?, inner.clone());
+        let res = io.peer_addr().map(|pa| {
+            let (handle, closed) = ClientHandle::new(pa);
+            let svc = self.inner.new_service(handle.clone());
+            let svc = SetClientHandle::new(handle, svc);
+            (svc, closed)
+        });
 
-            match version {
-                Version::Http1 => {
-                    // Enable support for HTTP upgrades (CONNECT and websockets).
-                    let mut conn = server
-                        .http1_only(true)
-                        .serve_connection(io, upgrade::Service::new(svc, drain.clone()))
-                        .with_upgrades();
-                    tokio::select! {
-                        res = &mut conn => {
-                            debug!(?res, "The client is shutting down the connection");
-                            res?
+        Box::pin(
+            async move {
+                let (svc, closed) = res?;
+                debug!(?version, "Handling as HTTP");
+                match version {
+                    Version::Http1 => {
+                        // Enable support for HTTP upgrades (CONNECT and websockets).
+                        let svc = upgrade::Service::new(BoxRequest::new(svc), drain.clone());
+                        let mut conn = server
+                            .http1_only(true)
+                            .serve_connection(io, svc)
+                            .with_upgrades();
+
+                        tokio::select! {
+                            res = &mut conn => {
+                                debug!(?res, "The client is shutting down the connection");
+                                res?
+                            }
+                            shutdown = drain.signaled() => {
+                                debug!("The process is shutting down the connection");
+                                Pin::new(&mut conn).graceful_shutdown();
+                                shutdown.release_after(conn).await?;
+                            }
+                            () = closed => {
+                                debug!("The stack is tearing down the connection");
+                                Pin::new(&mut conn).graceful_shutdown();
+                                conn.await?;
+                            }
                         }
-                        shutdown = drain.signaled() => {
-                            debug!("The process is shutting down the connection");
-                            Pin::new(&mut conn).graceful_shutdown();
-                            shutdown.release_after(conn).await?;
-                        }
-                        () = closed => {
-                            debug!("The stack is tearing down the connection");
-                            Pin::new(&mut conn).graceful_shutdown();
-                            conn.await?;
+                    }
+
+                    Version::H2 => {
+                        let mut conn = server
+                            .http2_only(true)
+                            .serve_connection(io, BoxRequest::new(svc));
+
+                        tokio::select! {
+                            res = &mut conn => {
+                                debug!(?res, "The client is shutting down the connection");
+                                res?
+                            }
+                            shutdown = drain.signaled() => {
+                                debug!("The process is shutting down the connection");
+                                Pin::new(&mut conn).graceful_shutdown();
+                                shutdown.release_after(conn).await?;
+                            }
+                            () = closed => {
+                                debug!("The stack is tearing down the connection");
+                                Pin::new(&mut conn).graceful_shutdown();
+                                conn.await?;
+                            }
                         }
                     }
                 }
-                Version::H2 => {
-                    let mut conn = server
-                        .http2_only(true)
-                        .serve_connection(io, HyperServerSvc::new(svc));
-                    tokio::select! {
-                        res = &mut conn => {
-                            debug!(?res, "The client is shutting down the connection");
-                            res?
-                        }
-                        shutdown = drain.signaled() => {
-                            debug!("The process is shutting down the connection");
-                            Pin::new(&mut conn).graceful_shutdown();
-                            shutdown.release_after(conn).await?;
-                        }
-                        () = closed => {
-                            debug!("The stack is tearing down the connection");
-                            Pin::new(&mut conn).graceful_shutdown();
-                            conn.await?;
-                        }
-                    }
-                }
+                Ok(())
             }
-            Ok(())
-        })
+            .instrument(tracing::debug_span!("http").or_current()),
+        )
     }
 }

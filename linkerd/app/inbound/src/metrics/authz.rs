@@ -1,7 +1,11 @@
-use crate::policy::{AllowPolicy, Permit};
+use crate::policy::{AllowPolicy, HttpRoutePermit, ServerPermit};
 use linkerd_app_core::{
-    metrics::{metrics, AuthzLabels, Counter, FmtMetrics, ServerLabel, TargetAddr, TlsAccept},
+    metrics::{
+        metrics, Counter, FmtLabels, FmtMetrics, RouteAuthzLabels, RouteLabels, ServerAuthzLabels,
+        ServerLabel, TargetAddr, TlsAccept,
+    },
     tls,
+    transport::OrigDstAddr,
 };
 use parking_lot::Mutex;
 use std::{collections::HashMap, sync::Arc};
@@ -12,6 +16,9 @@ metrics! {
     },
     inbound_http_authz_deny_total: Counter {
         "The total number of inbound HTTP requests that could not be processed due to a proxy error."
+    },
+    inbound_http_route_not_found_total: Counter {
+        "The total number of inbound HTTP requests that could not be associated with a route"
     },
 
     inbound_tcp_authz_allow_total: Counter {
@@ -33,48 +40,61 @@ pub(crate) struct TcpAuthzMetrics(Arc<TcpInner>);
 
 #[derive(Debug, Default)]
 struct HttpInner {
-    allow: Mutex<HashMap<AuthzKey, Counter>>,
-    deny: Mutex<HashMap<SrvKey, Counter>>,
+    allow: Mutex<HashMap<RouteAuthzKey, Counter>>,
+    deny: Mutex<HashMap<RouteKey, Counter>>,
+    route_not_found: Mutex<HashMap<ServerKey, Counter>>,
 }
 
 #[derive(Debug, Default)]
 struct TcpInner {
-    allow: Mutex<HashMap<AuthzKey, Counter>>,
-    deny: Mutex<HashMap<SrvKey, Counter>>,
-    terminate: Mutex<HashMap<SrvKey, Counter>>,
+    allow: Mutex<HashMap<ServerAuthzKey, Counter>>,
+    deny: Mutex<HashMap<ServerKey, Counter>>,
+    terminate: Mutex<HashMap<ServerKey, Counter>>,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq)]
-struct SrvKey {
+struct Key<L> {
     target: TargetAddr,
-    server: ServerLabel,
     tls: tls::ConditionalServerTls,
+    labels: L,
 }
 
-#[derive(Debug, Hash, PartialEq, Eq)]
-struct AuthzKey {
-    target: TargetAddr,
-    authz: AuthzLabels,
-    tls: tls::ConditionalServerTls,
-}
+type ServerKey = Key<ServerLabel>;
+type ServerAuthzKey = Key<ServerAuthzLabels>;
+type RouteKey = Key<RouteLabels>;
+type RouteAuthzKey = Key<RouteAuthzLabels>;
 
 // === impl HttpAuthzMetrics ===
 
 impl HttpAuthzMetrics {
-    pub fn allow(&self, permit: &Permit, tls: tls::ConditionalServerTls) {
+    pub fn allow(&self, permit: &HttpRoutePermit, tls: tls::ConditionalServerTls) {
         self.0
             .allow
             .lock()
-            .entry(AuthzKey::new(permit, tls))
+            .entry(RouteAuthzKey::from_permit(permit, tls))
             .or_default()
             .incr();
     }
 
-    pub fn deny(&self, policy: &AllowPolicy, tls: tls::ConditionalServerTls) {
+    pub fn route_not_found(
+        &self,
+        labels: ServerLabel,
+        dst: OrigDstAddr,
+        tls: tls::ConditionalServerTls,
+    ) {
+        self.0
+            .route_not_found
+            .lock()
+            .entry(ServerKey::new(labels, dst, tls))
+            .or_default()
+            .incr();
+    }
+
+    pub fn deny(&self, labels: RouteLabels, dst: OrigDstAddr, tls: tls::ConditionalServerTls) {
         self.0
             .deny
             .lock()
-            .entry(SrvKey::new(policy, tls))
+            .entry(RouteKey::new(labels, dst, tls))
             .or_default()
             .incr();
     }
@@ -89,7 +109,7 @@ impl FmtMetrics for HttpAuthzMetrics {
                 f,
                 allow
                     .iter()
-                    .map(|(k, c)| ((k.target, (&k.authz, TlsAccept(&k.tls))), c)),
+                    .map(|(k, c)| ((k.target, (&k.labels, TlsAccept(&k.tls))), c)),
                 |c| c,
             )?;
         }
@@ -101,11 +121,24 @@ impl FmtMetrics for HttpAuthzMetrics {
             inbound_http_authz_deny_total.fmt_scopes(
                 f,
                 deny.iter()
-                    .map(|(k, c)| ((k.target, (&k.server, TlsAccept(&k.tls))), c)),
+                    .map(|(k, c)| ((k.target, (&k.labels, TlsAccept(&k.tls))), c)),
                 |c| c,
             )?;
         }
         drop(deny);
+
+        let route_not_found = self.0.route_not_found.lock();
+        if !route_not_found.is_empty() {
+            inbound_http_route_not_found_total.fmt_help(f)?;
+            inbound_http_route_not_found_total.fmt_scopes(
+                f,
+                route_not_found
+                    .iter()
+                    .map(|(k, c)| ((k.target, (&k.labels, TlsAccept(&k.tls))), c)),
+                |c| c,
+            )?;
+        }
+        drop(route_not_found);
 
         Ok(())
     }
@@ -114,11 +147,11 @@ impl FmtMetrics for HttpAuthzMetrics {
 // === impl TcpAuthzMetrics ===
 
 impl TcpAuthzMetrics {
-    pub fn allow(&self, permit: &Permit, tls: tls::ConditionalServerTls) {
+    pub fn allow(&self, permit: &ServerPermit, tls: tls::ConditionalServerTls) {
         self.0
             .allow
             .lock()
-            .entry(AuthzKey::new(permit, tls))
+            .entry(ServerAuthzKey::from_permit(permit, tls))
             .or_default()
             .incr();
     }
@@ -127,7 +160,7 @@ impl TcpAuthzMetrics {
         self.0
             .deny
             .lock()
-            .entry(SrvKey::new(policy, tls))
+            .entry(ServerKey::from_policy(policy, tls))
             .or_default()
             .incr();
     }
@@ -136,7 +169,7 @@ impl TcpAuthzMetrics {
         self.0
             .terminate
             .lock()
-            .entry(SrvKey::new(policy, tls))
+            .entry(ServerKey::from_policy(policy, tls))
             .or_default()
             .incr();
     }
@@ -147,38 +180,21 @@ impl FmtMetrics for TcpAuthzMetrics {
         let allow = self.0.allow.lock();
         if !allow.is_empty() {
             inbound_tcp_authz_allow_total.fmt_help(f)?;
-            inbound_tcp_authz_allow_total.fmt_scopes(
-                f,
-                allow
-                    .iter()
-                    .map(|(k, c)| ((k.target, (&k.authz, TlsAccept(&k.tls))), c)),
-                |c| c,
-            )?;
+            inbound_tcp_authz_allow_total.fmt_scopes(f, &*allow, |c| c)?;
         }
         drop(allow);
 
         let deny = self.0.deny.lock();
         if !deny.is_empty() {
             inbound_tcp_authz_deny_total.fmt_help(f)?;
-            inbound_tcp_authz_deny_total.fmt_scopes(
-                f,
-                deny.iter()
-                    .map(|(k, c)| ((k.target, (&k.server, TlsAccept(&k.tls))), c)),
-                |c| c,
-            )?;
+            inbound_tcp_authz_deny_total.fmt_scopes(f, &*deny, |c| c)?;
         }
         drop(deny);
 
         let terminate = self.0.terminate.lock();
         if !terminate.is_empty() {
             inbound_tcp_authz_terminate_total.fmt_help(f)?;
-            inbound_tcp_authz_terminate_total.fmt_scopes(
-                f,
-                terminate
-                    .iter()
-                    .map(|(k, c)| ((k.target, (&k.server, TlsAccept(&k.tls))), c)),
-                |c| c,
-            )?;
+            inbound_tcp_authz_terminate_total.fmt_scopes(f, &*terminate, |c| c)?;
         }
         drop(terminate);
 
@@ -186,26 +202,38 @@ impl FmtMetrics for TcpAuthzMetrics {
     }
 }
 
-// === impl SrvKey ===
+// === impl Key ===
 
-impl SrvKey {
-    fn new(policy: &AllowPolicy, tls: tls::ConditionalServerTls) -> Self {
+impl<L> Key<L> {
+    fn new(labels: L, dst: OrigDstAddr, tls: tls::ConditionalServerTls) -> Self {
         Self {
-            target: TargetAddr(policy.dst_addr().into()),
-            server: policy.server_label(),
             tls,
+            target: TargetAddr(dst.into()),
+            labels,
         }
     }
 }
 
-// === impl AuthzKey ===
+impl<L: FmtLabels> FmtLabels for Key<L> {
+    fn fmt_labels(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        (self.target, (&self.labels, TlsAccept(&self.tls))).fmt_labels(f)
+    }
+}
 
-impl AuthzKey {
-    fn new(permit: &Permit, tls: tls::ConditionalServerTls) -> Self {
-        Self {
-            target: TargetAddr(permit.dst.into()),
-            authz: permit.labels.clone(),
-            tls,
-        }
+impl ServerKey {
+    fn from_policy(policy: &AllowPolicy, tls: tls::ConditionalServerTls) -> Self {
+        Self::new(policy.server_label(), policy.dst_addr(), tls)
+    }
+}
+
+impl RouteAuthzKey {
+    fn from_permit(permit: &HttpRoutePermit, tls: tls::ConditionalServerTls) -> Self {
+        Self::new(permit.labels.clone(), permit.dst, tls)
+    }
+}
+
+impl ServerAuthzKey {
+    fn from_permit(permit: &ServerPermit, tls: tls::ConditionalServerTls) -> Self {
+        Self::new(permit.labels.clone(), permit.dst, tls)
     }
 }

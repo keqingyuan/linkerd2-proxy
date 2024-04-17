@@ -1,6 +1,6 @@
 mod client_hello;
 
-use crate::{NegotiatedProtocol, ServerId};
+use crate::{NegotiatedProtocol, ServerName};
 use bytes::BytesMut;
 use futures::prelude::*;
 use linkerd_conditional::Conditional;
@@ -12,16 +12,15 @@ use std::{
     fmt,
     ops::Deref,
     pin::Pin,
-    str::FromStr,
     task::{Context, Poll},
 };
 use thiserror::Error;
 use tokio::time::{self, Duration};
 use tracing::{debug, trace, warn};
 
-/// A newtype for remote client idenities.
+/// Describes the authenticated identity of a remote client.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct ClientId(pub id::Name);
+pub struct ClientId(pub id::Id);
 
 /// Indicates a server-side connection's TLS status.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
@@ -31,7 +30,7 @@ pub enum ServerTls {
         negotiated_protocol: Option<NegotiatedProtocol>,
     },
     Passthru {
-        sni: ServerId,
+        sni: ServerName,
     },
 }
 
@@ -82,12 +81,13 @@ pub struct DetectTls<T, L, P, N> {
     inner: N,
 }
 
-// The initial peek buffer is statically allocated on the stack and is fairly small; but it is
-// large enough to hold the ~300B ClientHello sent by proxies.
+// The initial peek buffer is fairly small so that we can avoid allocating more
+// data then we need; but it is large enough to hold the ~300B ClientHello sent
+// by proxies.
 const PEEK_CAPACITY: usize = 512;
 
-// A larger fallback buffer is allocated onto the heap if the initial peek buffer is
-// insufficient. This is the same value used in HTTP detection.
+// A larger fallback buffer is allocated onto the heap if the initial peek
+// buffer is insufficient. This is the same value used in HTTP detection.
 const BUFFER_CAPACITY: usize = 8192;
 
 impl<L, P, N> NewDetectTls<L, P, N> {
@@ -133,7 +133,7 @@ where
     T: Clone + Send + 'static,
     P: InsertParam<ConditionalServerTls, T> + Clone + Send + Sync + 'static,
     P::Target: Send + 'static,
-    L: Param<id::LocalId> + Clone + Send + 'static,
+    L: Param<ServerName> + Clone + Send + 'static,
     L: Service<DetectIo<I>, Response = (ServerTls, LIo), Error = io::Error>,
     L::Future: Send,
     LIo: io::AsyncRead + io::AsyncWrite + Send + Sync + Unpin + 'static,
@@ -163,10 +163,10 @@ where
         Box::pin(async move {
             let (sni, io) = detect.await.map_err(|_| ServerTlsTimeoutError(()))??;
 
-            let id::LocalId(id) = tls.param();
+            let local_server_name = tls.param();
             let (peer, io) = match sni {
                 // If we detected an SNI matching this proxy, terminate TLS.
-                Some(ServerId(sni)) if sni == id => {
+                Some(sni) if sni == local_server_name => {
                     trace!("Identified local SNI");
                     let (peer, io) = tls.oneshot(io).await?;
                     (Conditional::Some(peer), EitherIo::Left(io))
@@ -192,22 +192,22 @@ where
 }
 
 /// Peek or buffer the provided stream to determine an SNI value.
-async fn detect_sni<I>(mut io: I) -> io::Result<(Option<ServerId>, DetectIo<I>)>
+async fn detect_sni<I>(mut io: I) -> io::Result<(Option<ServerName>, DetectIo<I>)>
 where
     I: io::Peek + io::AsyncRead + io::AsyncWrite + Send + Sync + Unpin,
 {
-    // First, try to use MSG_PEEK to read the SNI from the TLS ClientHello.
-    // Because peeked data does not need to be retained, we use a static
-    // buffer to prevent needless heap allocation.
+    // First, try to use MSG_PEEK to read the SNI from the TLS ClientHello. We
+    // use a heap-allocated buffer to avoid creating a large `Future` (since we
+    // need to hold the buffer across an await).
     //
-    // Anecdotally, the ClientHello sent by Linkerd proxies is <300B. So a
-    // ~500B byte buffer is more than enough.
-    let mut buf = [0u8; PEEK_CAPACITY];
+    // Anecdotally, the ClientHello sent by Linkerd proxies is <300B. So a ~500B
+    // byte buffer is more than enough.
+    let mut buf = BytesMut::with_capacity(PEEK_CAPACITY);
     let sz = io.peek(&mut buf).await?;
     debug!(sz, "Peeked bytes from TCP stream");
     // Peek may return 0 bytes if the socket is not peekable.
     if sz > 0 {
-        match client_hello::parse_sni(&buf) {
+        match client_hello::parse_sni(buf.as_ref()) {
             Ok(sni) => {
                 return Ok((sni, EitherIo::Left(io)));
             }
@@ -248,22 +248,22 @@ where
 
 // === impl ClientId ===
 
-impl From<id::Name> for ClientId {
-    fn from(n: id::Name) -> Self {
+impl From<id::Id> for ClientId {
+    fn from(n: id::Id) -> Self {
         Self(n)
     }
 }
 
-impl From<ClientId> for id::Name {
-    fn from(ClientId(name): ClientId) -> id::Name {
-        name
+impl From<ClientId> for id::Id {
+    fn from(ClientId(id): ClientId) -> id::Id {
+        id
     }
 }
 
 impl Deref for ClientId {
-    type Target = id::Name;
+    type Target = id::Id;
 
-    fn deref(&self) -> &id::Name {
+    fn deref(&self) -> &id::Id {
         &self.0
     }
 }
@@ -274,10 +274,10 @@ impl fmt::Display for ClientId {
     }
 }
 
-impl FromStr for ClientId {
-    type Err = id::InvalidName;
+impl std::str::FromStr for ClientId {
+    type Err = linkerd_error::Error;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        id::Name::from_str(s).map(Self)
+        id::Id::from_str(s).map(Self)
     }
 }
 
@@ -309,7 +309,6 @@ impl ServerTls {
 mod tests {
     use super::*;
     use linkerd_io::AsyncWriteExt;
-    use std::str::FromStr;
 
     #[tokio::test(flavor = "current_thread")]
     async fn detect_buffered() {
@@ -320,7 +319,7 @@ mod tests {
         let len = input.len();
         let client_task = tokio::spawn(async move {
             client_io
-                .write_all(&*input)
+                .write_all(input)
                 .await
                 .expect("Write must succeed");
         });
@@ -329,8 +328,7 @@ mod tests {
             .await
             .expect("SNI detection must not fail");
 
-        let identity = id::Name::from_str("example.com").unwrap();
-        assert_eq!(sni, Some(ServerId(identity)));
+        assert_eq!(sni, Some(ServerName("example.com".parse().unwrap())));
 
         match io {
             EitherIo::Left(_) => panic!("Detected IO should be buffered"),

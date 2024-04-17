@@ -14,8 +14,8 @@ members = [
     "linkerd/app/outbound",
     "linkerd/app/test",
     "linkerd/app",
-    "linkerd/cache",
     "linkerd/conditional",
+    "linkerd/distribute",
     "linkerd/detect",
     "linkerd/dns/name",
     "linkerd/dns",
@@ -24,37 +24,49 @@ members = [
     "linkerd/errno",
     "linkerd/error-respond",
     "linkerd/exp-backoff",
-    "linkerd/http-access-log",
-    "linkerd/http-box",
-    "linkerd/http-classify",
-    "linkerd/http-metrics",
-    "linkerd/http-retry",
+    "linkerd/http/access-log",
+    "linkerd/http/box",
+    "linkerd/http/classify",
+    "linkerd/http/metrics",
+    "linkerd/http/retry",
+    "linkerd/http/route",
     "linkerd/identity",
+    "linkerd/idle-cache",
     "linkerd/io",
     "linkerd/meshtls",
     "linkerd/meshtls/boring",
     "linkerd/meshtls/rustls",
+    "linkerd/meshtls/verifier",
     "linkerd/metrics",
     "linkerd/opencensus",
+    "linkerd/pool",
+    "linkerd/pool/mock",
+    "linkerd/pool/p2c",
     "linkerd/proxy/api-resolve",
-    "linkerd/proxy/dns-resolve",
+    "linkerd/proxy/balance",
+    "linkerd/proxy/balance/gauge-endpoints",
+    "linkerd/proxy/balance/queue",
+    "linkerd/proxy/client-policy",
     "linkerd/proxy/core",
-    "linkerd/proxy/discover",
+    "linkerd/proxy/dns-resolve",
     "linkerd/proxy/http",
     "linkerd/proxy/identity-client",
+    "linkerd/proxy/spire-client",
     "linkerd/proxy/resolve",
+    "linkerd/proxy/server-policy",
     "linkerd/proxy/tap",
     "linkerd/proxy/tcp",
     "linkerd/proxy/transport",
     "linkerd/reconnect",
     "linkerd/retry",
-    "linkerd/server-policy",
+    "linkerd/router",
     "linkerd/service-profiles",
     "linkerd/signal",
     "linkerd/stack",
     "linkerd/stack/metrics",
     "linkerd/stack/tracing",
     "linkerd/system",
+    "linkerd/tonic-stream",
     "linkerd/tonic-watch",
     "linkerd/tls",
     "linkerd/tls/test-util",
@@ -63,18 +75,10 @@ members = [
     "linkerd/transport-metrics",
     "linkerd2-proxy",
     "opencensus-proto",
+    "spiffe-proto",
+    "tools",
 ]
 
-# Debug symbols end up chewing up several GB of disk space, so better to just
-# disable them.
-[profile.dev]
-debug = false
-
-[profile.test]
-debug = false
-
 [profile.release]
+debug = 1
 lto = true
-
-[patch.crates-io]
-webpki = { git = "https://github.com/linkerd/webpki", branch = "cert-dns-names-0.22" }

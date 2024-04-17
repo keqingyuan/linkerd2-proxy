@@ -1,39 +1,62 @@
-#![deny(
-    warnings,
-    rust_2018_idioms,
-    clippy::disallowed_methods,
-    clippy::disallowed_types
-)]
+#![deny(rust_2018_idioms, clippy::disallowed_methods, clippy::disallowed_types)]
 #![forbid(unsafe_code)]
 
 //! Utilities for exposing metrics to Prometheus.
 
 mod counter;
+mod fmt;
 mod gauge;
 mod histogram;
 pub mod latency;
 #[cfg(feature = "linkerd-stack")]
 mod new_metrics;
-mod prom;
-mod scopes;
+#[cfg(feature = "process")]
+pub mod process;
 mod serve;
 mod store;
-#[cfg(feature = "summary")]
-mod summary;
 
 #[cfg(feature = "linkerd-stack")]
 pub use self::new_metrics::NewMetrics;
-#[cfg(feature = "summary")]
-pub use self::summary::Summary;
 pub use self::{
     counter::Counter,
+    fmt::{FmtLabels, FmtMetric, FmtMetrics, Metric},
     gauge::Gauge,
     histogram::Histogram,
-    prom::{FmtLabels, FmtMetric, FmtMetrics, Metric},
-    scopes::Scopes,
     serve::Serve,
     store::{LastUpdate, SharedStore, Store},
 };
+
+/// Integration with the [`prometheus_client`]` crate.
+///
+/// This should be used for all new metrics.
+pub mod prom {
+    use std::sync::Arc;
+
+    pub use prometheus_client::{
+        metrics::{
+            counter::{ConstCounter, Counter},
+            family::Family,
+            gauge::{ConstGauge, Gauge},
+            histogram::Histogram,
+            info::Info,
+        },
+        registry::{Registry, Unit},
+        *,
+    };
+
+    pub trait EncodeLabelSetMut: encoding::EncodeLabelSet {
+        fn encode_label_set(&self, dst: &mut encoding::LabelSetEncoder<'_>) -> std::fmt::Result;
+    }
+
+    pub type Report = Arc<Registry>;
+
+    impl crate::FmtMetrics for Report {
+        #[inline]
+        fn fmt_metrics(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            encoding::text::encode(f, self)
+        }
+    }
+}
 
 #[macro_export]
 macro_rules! metrics {
@@ -54,10 +77,6 @@ pub trait Factor {
     fn factor(n: u64) -> f64;
 }
 
-pub struct MicrosAsSeconds;
-
-pub struct MillisAsSeconds;
-
 /// Largest `u64` that can fit without loss of precision in `f64` (2^53).
 ///
 /// Wrapping is based on the fact that Prometheus models values as f64 (52-bits
@@ -68,17 +87,5 @@ const MAX_PRECISE_UINT64: u64 = 0x20_0000_0000_0000;
 impl Factor for () {
     fn factor(n: u64) -> f64 {
         n.wrapping_rem(MAX_PRECISE_UINT64 + 1) as f64
-    }
-}
-
-impl Factor for MillisAsSeconds {
-    fn factor(n: u64) -> f64 {
-        n.wrapping_rem((MAX_PRECISE_UINT64 + 1) * 1000) as f64 * 0.001
-    }
-}
-
-impl Factor for MicrosAsSeconds {
-    fn factor(n: u64) -> f64 {
-        n.wrapping_rem((MAX_PRECISE_UINT64 + 1) * 1_000) as f64 * 0.000_001
     }
 }

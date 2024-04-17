@@ -1,0 +1,33 @@
+coverage:
+  ignore:
+    - "linkerd/app/integration/src/**"
+    - "**/src/gen/**"
+    - "tools/**"
+
+  precision: 2
+  round: down
+  range: "70...100"
+
+  status:
+    project:
+      default:
+        target: auto
+        threshold: 2%
+        if_not_found: success
+        if_ci_failed: error
+        paths:
+          - "!linkerd/app/integration/src/**"
+          - "!**/src/gen/**"
+          - "!tools/**"
+
+    patch:
+      default:
+        target: auto
+        threshold: 1%
+        if_not_found: success
+        if_ci_failed: error
+
+comment:
+  layout: "header, diff, files, footer"
+  behavior: default
+  require_changes: false

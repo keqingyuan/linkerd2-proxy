@@ -4,8 +4,7 @@ use std::{
     collections::VecDeque,
     fs, io,
     path::{Path, PathBuf},
-    sync::Arc,
-    time::{Duration, SystemTime},
+    time::SystemTime,
 };
 
 use linkerd2_proxy_api::identity as pb;
@@ -114,8 +113,8 @@ impl Identity {
             .with_safe_default_kx_groups()
             .with_protocol_versions(TLS_VERSIONS)
             .expect("server config must be valid")
-            .with_client_cert_verifier(rustls::server::AllowAnyAnonymousOrAuthenticatedClient::new(
-                roots,
+            .with_client_cert_verifier(Arc::new(
+                rustls::server::AllowAnyAnonymousOrAuthenticatedClient::new(roots),
             ))
             .with_single_cert(certs.chain(), key)
             .unwrap();
@@ -161,6 +160,7 @@ impl Identity {
         env.put(app::env::ENV_IDENTITY_DIR, id_dir);
         env.put(app::env::ENV_IDENTITY_TOKEN_FILE, token);
         env.put(app::env::ENV_IDENTITY_TRUST_ANCHORS, trust_anchors);
+        env.put(app::env::ENV_POLICY_WORKLOAD, format!("test:{local_name}"));
         env.put(app::env::ENV_IDENTITY_IDENTITY_LOCAL_NAME, local_name);
 
         Self {

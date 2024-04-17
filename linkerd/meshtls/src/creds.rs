@@ -1,6 +1,9 @@
+use std::time::SystemTime;
+
 use crate::{NewClient, Server};
+use linkerd_dns_name as dns;
 use linkerd_error::Result;
-use linkerd_identity::{Credentials, DerX509, Name};
+use linkerd_identity::{Credentials, DerX509, Id};
 
 #[cfg(feature = "boring")]
 pub use crate::boring;
@@ -32,44 +35,22 @@ pub enum Receiver {
 // === impl Store ===
 
 impl Credentials for Store {
-    fn dns_name(&self) -> &Name {
-        match self {
-            #[cfg(feature = "boring")]
-            Self::Boring(store) => store.dns_name(),
-
-            #[cfg(feature = "rustls")]
-            Self::Rustls(store) => store.dns_name(),
-            #[cfg(not(feature = "__has_any_tls_impls"))]
-            _ => crate::no_tls!(),
-        }
-    }
-
-    fn gen_certificate_signing_request(&mut self) -> DerX509 {
-        match self {
-            #[cfg(feature = "boring")]
-            Self::Boring(store) => store.gen_certificate_signing_request(),
-
-            #[cfg(feature = "rustls")]
-            Self::Rustls(store) => store.gen_certificate_signing_request(),
-            #[cfg(not(feature = "__has_any_tls_impls"))]
-            _ => crate::no_tls!(),
-        }
-    }
-
     fn set_certificate(
         &mut self,
         leaf: DerX509,
         chain: Vec<DerX509>,
-        expiry: std::time::SystemTime,
+        key: Vec<u8>,
+        exp: SystemTime,
     ) -> Result<()> {
         match self {
             #[cfg(feature = "boring")]
-            Self::Boring(store) => store.set_certificate(leaf, chain, expiry),
+            Self::Boring(store) => store.set_certificate(leaf, chain, key, exp),
 
             #[cfg(feature = "rustls")]
-            Self::Rustls(store) => store.set_certificate(leaf, chain, expiry),
+            Self::Rustls(store) => store.set_certificate(leaf, chain, key, exp),
+
             #[cfg(not(feature = "__has_any_tls_impls"))]
-            _ => crate::no_tls!(leaf, chain, expiry),
+            _ => crate::no_tls!(leaf, chain, key, exp),
         }
     }
 }
@@ -91,13 +72,25 @@ impl From<rustls::creds::Receiver> for Receiver {
 }
 
 impl Receiver {
-    pub fn name(&self) -> &Name {
+    pub fn local_id(&self) -> &Id {
         match self {
             #[cfg(feature = "boring")]
-            Self::Boring(receiver) => receiver.name(),
+            Self::Boring(receiver) => receiver.local_id(),
 
             #[cfg(feature = "rustls")]
-            Self::Rustls(receiver) => receiver.name(),
+            Self::Rustls(receiver) => receiver.local_id(),
+            #[cfg(not(feature = "__has_any_tls_impls"))]
+            _ => crate::no_tls!(),
+        }
+    }
+
+    pub fn server_name(&self) -> &dns::Name {
+        match self {
+            #[cfg(feature = "boring")]
+            Self::Boring(receiver) => receiver.server_name(),
+
+            #[cfg(feature = "rustls")]
+            Self::Rustls(receiver) => receiver.server_name(),
             #[cfg(not(feature = "__has_any_tls_impls"))]
             _ => crate::no_tls!(),
         }

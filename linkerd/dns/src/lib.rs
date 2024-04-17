@@ -1,25 +1,16 @@
-#![deny(
-    warnings,
-    rust_2018_idioms,
-    clippy::disallowed_methods,
-    clippy::disallowed_types
-)]
+#![deny(rust_2018_idioms, clippy::disallowed_methods, clippy::disallowed_types)]
 #![forbid(unsafe_code)]
 
+pub use hickory_resolver::config::ResolverOpts;
+use hickory_resolver::{
+    config::ResolverConfig, error, proto::rr::rdata, system_conf, AsyncResolver, TokioAsyncResolver,
+};
 use linkerd_dns_name::NameRef;
 pub use linkerd_dns_name::{InvalidName, Name, Suffix};
-use linkerd_error::Error;
 use std::{fmt, net};
 use thiserror::Error;
 use tokio::time::{self, Instant};
 use tracing::{debug, trace};
-use trust_dns_resolver::{
-    config::ResolverConfig, proto::rr::rdata, system_conf, AsyncResolver, TokioAsyncResolver,
-};
-pub use trust_dns_resolver::{
-    config::ResolverOpts,
-    error::{ResolveError, ResolveErrorKind},
-};
 
 #[derive(Clone)]
 pub struct Resolver {
@@ -34,6 +25,26 @@ pub trait ConfigureResolver {
 #[error("invalid SRV record {:?}", self.0)]
 struct InvalidSrv(rdata::SRV);
 
+#[derive(Debug, Error)]
+#[error("failed to resolve A record: {0}")]
+struct ARecordError(#[from] error::ResolveError);
+
+#[derive(Debug, Error)]
+enum SrvRecordError {
+    #[error(transparent)]
+    Invalid(#[from] InvalidSrv),
+    #[error("failed to resolve SRV record: {0}")]
+    Resolve(#[from] error::ResolveError),
+}
+
+#[derive(Debug, Error)]
+#[error("failed SRV and A record lookups: {srv_error}; {a_error}")]
+pub struct ResolveError {
+    #[source]
+    a_error: ARecordError,
+    srv_error: SrvRecordError,
+}
+
 impl Resolver {
     /// Construct a new `Resolver` from environment variables and system
     /// configuration.
@@ -44,7 +55,7 @@ impl Resolver {
     /// could not be parsed.
     ///
     /// TODO: This should be infallible like it is in the `domain` crate.
-    pub fn from_system_config_with<C: ConfigureResolver>(c: &C) -> Result<Self, ResolveError> {
+    pub fn from_system_config_with<C: ConfigureResolver>(c: &C) -> std::io::Result<Self> {
         let (config, mut opts) = system_conf::read_system_conf()?;
         c.configure_resolver(&mut opts);
         trace!("DNS config: {:?}", &config);
@@ -57,36 +68,41 @@ impl Resolver {
         opts.cache_size = 0;
         // This function is synchronous, but needs to be called within the Tokio
         // 0.2 runtime context, since it gets a handle.
-        let dns = AsyncResolver::tokio(config, opts).expect("system DNS config must be valid");
+        let dns = AsyncResolver::tokio(config, opts);
         Resolver { dns }
     }
 
-    /// Resolves a name to a set of addresses, preferring SRV records to normal A
+    /// Resolves a name to a set of addresses, preferring SRV records to normal A/AAAA
     /// record lookups.
     pub async fn resolve_addrs(
         &self,
         name: NameRef<'_>,
         default_port: u16,
-    ) -> Result<(Vec<net::SocketAddr>, time::Sleep), Error> {
+    ) -> Result<(Vec<net::SocketAddr>, time::Sleep), ResolveError> {
         match self.resolve_srv(name).await {
             Ok(res) => Ok(res),
-            Err(e) if e.is::<InvalidSrv>() => {
-                let (ips, delay) = self.resolve_a(name).await?;
+            Err(srv_error) => {
+                // If the SRV lookup failed for any reason, fall back to A/AAAA
+                // record resolution.
+                debug!(srv.error = %srv_error, "Falling back to A/AAAA record lookup");
+                let (ips, delay) = match self.resolve_a_or_aaaa(name).await {
+                    Ok(res) => res,
+                    Err(a_error) => return Err(ResolveError { a_error, srv_error }),
+                };
                 let addrs = ips
                     .into_iter()
                     .map(|ip| net::SocketAddr::new(ip, default_port))
                     .collect();
                 Ok((addrs, delay))
             }
-            Err(e) => Err(e),
         }
     }
 
-    async fn resolve_a(
+    async fn resolve_a_or_aaaa(
         &self,
         name: NameRef<'_>,
-    ) -> Result<(Vec<net::IpAddr>, time::Sleep), ResolveError> {
-        debug!(%name, "resolve_a");
+    ) -> Result<(Vec<net::IpAddr>, time::Sleep), ARecordError> {
+        debug!(%name, "Resolving an A/AAAA record");
         let lookup = self.dns.lookup_ip(name.as_str()).await?;
         let valid_until = Instant::from_std(lookup.valid_until());
         let ips = lookup.iter().collect::<Vec<_>>();
@@ -96,8 +112,8 @@ impl Resolver {
     async fn resolve_srv(
         &self,
         name: NameRef<'_>,
-    ) -> Result<(Vec<net::SocketAddr>, time::Sleep), Error> {
-        debug!(%name, "resolve_srv");
+    ) -> Result<(Vec<net::SocketAddr>, time::Sleep), SrvRecordError> {
+        debug!(%name, "Resolving a SRV record");
         let srv = self.dns.srv_lookup(name.as_str()).await?;
 
         let valid_until = Instant::from_std(srv.as_lookup().valid_until());
@@ -111,16 +127,20 @@ impl Resolver {
     }
 
     // XXX We need to convert the SRV records to an IP addr manually,
-    // because of: https://github.com/bluejekyll/trust-dns/issues/872
+    // because of: https://github.com/hickory-dns/hickory-dns/issues/872
     // Here we rely in on the fact that the first label of the SRV
     // record's target will be the ip of the pod delimited by dashes
-    // instead of dots. We can alternatively do another lookup
+    // instead of dots/colons. We can alternatively do another lookup
     // on the pod's DNS but it seems unnecessary since the pod's
     // ip is in the target of the SRV record.
     fn srv_to_socket_addr(srv: rdata::SRV) -> Result<net::SocketAddr, InvalidSrv> {
         if let Some(first_label) = srv.target().iter().next() {
             if let Ok(utf8) = std::str::from_utf8(first_label) {
-                if let Ok(ip) = utf8.replace('-', ".").parse::<std::net::IpAddr>() {
+                let mut res = utf8.replace('-', ".").parse::<std::net::IpAddr>();
+                if res.is_err() {
+                    res = utf8.replace('-', ":").parse::<std::net::IpAddr>();
+                }
+                if let Ok(ip) = res {
                     return Ok(net::SocketAddr::new(ip, srv.port()));
                 }
             }
@@ -139,10 +159,39 @@ impl fmt::Debug for Resolver {
     }
 }
 
+// === impl ResolveError ===
+
+impl ResolveError {
+    /// Returns the amount of time that the resolver should wait before
+    /// retrying.
+    pub fn negative_ttl(&self) -> Option<time::Duration> {
+        if let error::ResolveErrorKind::NoRecordsFound {
+            negative_ttl: Some(ttl_secs),
+            ..
+        } = self.a_error.0.kind()
+        {
+            return Some(time::Duration::from_secs(*ttl_secs as u64));
+        }
+
+        if let SrvRecordError::Resolve(error) = &self.srv_error {
+            if let error::ResolveErrorKind::NoRecordsFound {
+                negative_ttl: Some(ttl_secs),
+                ..
+            } = error.kind()
+            {
+                return Some(time::Duration::from_secs(*ttl_secs as u64));
+            }
+        }
+
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Name, Suffix};
-    use std::str::FromStr;
+    use super::{Name, Resolver, Suffix};
+    use hickory_resolver::proto::rr::{domain, rdata};
+    use std::{net, str::FromStr};
 
     #[test]
     fn test_dns_name_parsing() {
@@ -245,6 +294,42 @@ mod tests {
 
         assert!(Suffix::from_str("").is_err(), "suffix must not be empty");
     }
+
+    #[test]
+    fn srv_to_socket_addr_invalid() {
+        let name = "foobar.linkerd-dst-headless.linkerd.svc.cluster.local.";
+        let target = domain::Name::from_str(name).unwrap();
+        let srv = rdata::SRV::new(1, 1, 8086, target);
+        assert!(Resolver::srv_to_socket_addr(srv).is_err());
+    }
+
+    #[test]
+    fn srv_to_socket_addr_valid() {
+        struct Case {
+            input: &'static str,
+            output: &'static str,
+        }
+
+        for case in &[
+            Case {
+                input: "10-42-0-15.linkerd-dst-headless.linkerd.svc.cluster.local.",
+                output: "10.42.0.15",
+            },
+            Case {
+                input: "2001-0db8-0000-0000-0000-ff00-0042-8329.linkerd-dst-headless.linkerd.svc.cluster.local.",
+                output: "2001:0db8:0000:0000:0000:ff00:0042:8329",
+            },
+            Case {
+                input: "2001-0db8--0042-8329.linkerd-dst-headless.linkerd.svc.cluster.local.",
+                output: "2001:0db8::0042:8329",
+            },
+        ] {
+            let target = domain::Name::from_str(case.input).unwrap();
+            let srv = rdata::SRV::new(1, 1, 8086, target);
+            let socket = Resolver::srv_to_socket_addr(srv).unwrap();
+            assert_eq!(socket.ip(), net::IpAddr::from_str(case.output).unwrap());
+        }
+    }
 }
 
 #[cfg(fuzzing)]
@@ -263,7 +348,7 @@ pub mod fuzz_logic {
         if let Ok(name) = fuzz_data.parse::<Name>() {
             let fcon = FuzzConfig {};
             let resolver = Resolver::from_system_config_with(&fcon).unwrap();
-            let _w = resolver.resolve_a(name.as_ref()).await;
+            let _w = resolver.resolve_a_or_aaaa(name.as_ref()).await;
             let _w2 = resolver.resolve_srv(name.as_ref()).await;
         }
     }

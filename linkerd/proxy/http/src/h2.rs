@@ -1,4 +1,4 @@
-use crate::trace;
+use crate::executor::TracingExecutor;
 use futures::prelude::*;
 pub use h2::{Error as H2Error, Reason};
 use hyper::{
@@ -8,7 +8,6 @@ use hyper::{
 use linkerd_error::{Error, Result};
 use linkerd_stack::{MakeConnection, Service};
 use std::{
-    future::Future,
     marker::PhantomData,
     pin::Pin,
     task::{Context, Poll},
@@ -89,17 +88,17 @@ where
         let connect = self
             .connect
             .connect((crate::Version::H2, target))
-            .instrument(trace_span!("connect"));
+            .instrument(trace_span!("connect").or_current());
 
         Box::pin(
             async move {
                 let (io, _meta) = connect.err_into::<Error>().await?;
                 let mut builder = conn::Builder::new();
                 builder
+                    .executor(TracingExecutor)
                     .http2_only(true)
                     .http2_initial_stream_window_size(initial_stream_window_size)
-                    .http2_initial_connection_window_size(initial_connection_window_size)
-                    .executor(trace::Executor::new());
+                    .http2_initial_connection_window_size(initial_connection_window_size);
 
                 // Configure HTTP/2 PING frames
                 if let Some(timeout) = keepalive_timeout {
@@ -114,7 +113,7 @@ where
 
                 let (tx, conn) = builder
                     .handshake(io)
-                    .instrument(trace_span!("handshake"))
+                    .instrument(trace_span!("handshake").or_current())
                     .await?;
 
                 tokio::spawn(
@@ -124,7 +123,7 @@ where
 
                 Ok(Connection { tx })
             }
-            .instrument(debug_span!("h2")),
+            .instrument(debug_span!("h2").or_current()),
         )
     }
 }

@@ -1,9 +1,4 @@
-#![deny(
-    warnings,
-    rust_2018_idioms,
-    clippy::disallowed_methods,
-    clippy::disallowed_types
-)]
+#![deny(rust_2018_idioms, clippy::disallowed_methods, clippy::disallowed_types)]
 #![forbid(unsafe_code)]
 
 use hyper::body::HttpBody;
@@ -39,7 +34,7 @@ pub struct PendingUntilEosBody<T, B> {
     body: B,
 }
 
-// ==== PendingUntilFirstData ====
+// === PendingUntilFirstData ===
 
 impl<T, B> TrackCompletion<T, http::Response<B>> for PendingUntilFirstData
 where
@@ -60,7 +55,7 @@ where
     }
 }
 
-// ==== PendingUntilEos ====
+// === PendingUntilEos ===
 
 impl<T, B> TrackCompletion<T, http::Response<B>> for PendingUntilEos
 where
@@ -81,7 +76,7 @@ where
     }
 }
 
-// ==== PendingUntilFirstDataBody ====
+// === PendingUntilFirstDataBody ===
 
 impl<T, B> Default for PendingUntilFirstDataBody<T, B>
 where
@@ -139,7 +134,7 @@ where
     }
 }
 
-// ==== PendingUntilEosBody ====
+// === PendingUntilEosBody ===
 
 impl<T, B> Default for PendingUntilEosBody<T, B>
 where
@@ -423,7 +418,7 @@ mod tests {
         assert!(wk.upgrade().is_none());
     }
 
-    struct Handle(Arc<()>);
+    struct Handle(#[allow(dead_code)] Arc<()>);
     impl Handle {
         fn new() -> (Self, Weak<()>) {
             let strong = Arc::new(());

@@ -9,11 +9,15 @@ publish = false
 [features]
 rustls = ["linkerd-meshtls-rustls", "__has_any_tls_impls"]
 boring = ["linkerd-meshtls-boring", "__has_any_tls_impls"]
+boring-fips = ["boring", "linkerd-meshtls-boring/fips"]
 # Enabled if *any* TLS impl is enabled.
 __has_any_tls_impls = []
 
 [dependencies]
 futures = { version = "0.3", default-features = false }
+pin-project = "1"
+
+linkerd-dns-name = { path = "../dns/name" }
 linkerd-error = { path = "../error" }
 linkerd-identity = { path = "../identity" }
 linkerd-io = { path = "../io" }
@@ -21,12 +25,13 @@ linkerd-meshtls-boring = { path = "boring", optional = true }
 linkerd-meshtls-rustls = { path = "rustls", optional = true }
 linkerd-stack = { path = "../stack" }
 linkerd-tls = { path = "../tls" }
-pin-project = "1"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
+tracing = "0.1"
+rcgen = "0.12.0"
+
 linkerd-conditional = { path = "../conditional" }
 linkerd-proxy-transport = { path = "../proxy/transport" }
 linkerd-tls-test-util = { path = "../tls/test-util" }
 linkerd-tracing = { path = "../tracing", features = ["ansi"] }
-tokio = { version = "1", features = ["macros", "net", "rt-multi-thread"] }
-tracing = "0.1"

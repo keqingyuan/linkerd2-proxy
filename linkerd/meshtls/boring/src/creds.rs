@@ -7,26 +7,25 @@ use boring::{
     ssl,
     x509::{store::X509StoreBuilder, X509},
 };
+use linkerd_dns_name as dns;
 use linkerd_error::Result;
 use linkerd_identity as id;
 use std::sync::Arc;
 use tokio::sync::watch;
 
 pub fn watch(
-    identity: id::Name,
+    local_id: id::Id,
+    server_name: dns::Name,
     roots_pem: &str,
-    key_pkcs8: &[u8],
-    csr: &[u8],
 ) -> Result<(Store, Receiver)> {
     let creds = {
         let roots = X509::stack_from_pem(roots_pem.as_bytes())?;
-        let key = PKey::private_key_from_pkcs8(key_pkcs8)?;
-        Arc::new(BaseCreds { roots, key })
+        Arc::new(BaseCreds { roots })
     };
 
     let (tx, rx) = watch::channel(Creds::from(creds.clone()));
-    let rx = Receiver::new(identity.clone(), rx);
-    let store = Store::new(creds, csr, identity, tx);
+    let rx = Receiver::new(local_id.clone(), server_name, rx);
+    let store = Store::new(creds, local_id, tx);
 
     Ok((store, rx))
 }
@@ -38,12 +37,12 @@ pub(crate) struct Creds {
 
 struct BaseCreds {
     roots: Vec<X509>,
-    key: PKey<Private>,
 }
 
 struct Certs {
     leaf: X509,
     intermediates: Vec<X509>,
+    key: PKey<Private>,
 }
 
 pub(crate) type CredsRx = watch::Receiver<Creds>;
@@ -74,7 +73,7 @@ impl Creds {
                 .base
                 .roots
                 .iter()
-                .filter_map(|c| super::fingerprint(&*c))
+                .filter_map(|c| super::fingerprint(c))
                 .collect::<Vec<_>>(),
             "Configuring acceptor roots",
         );
@@ -85,10 +84,10 @@ impl Creds {
 
         if let Some(certs) = &self.certs {
             tracing::debug!(
-                cert = ?super::fingerprint(&*certs.leaf),
+                cert = ?super::fingerprint(&certs.leaf),
                 "Configuring acceptor certificate",
             );
-            conn.set_private_key(&self.base.key)?;
+            conn.set_private_key(&certs.key)?;
             conn.set_certificate(&certs.leaf)?;
             conn.check_private_key()?;
             for c in &certs.intermediates {
@@ -98,7 +97,7 @@ impl Creds {
 
         if !alpn_protocols.is_empty() {
             let p = serialize_alpn(alpn_protocols)?;
-            conn.set_alpn_protos(&*p)?;
+            conn.set_alpn_protos(&p)?;
         }
 
         Ok(conn.build())
@@ -123,7 +122,7 @@ impl Creds {
                 .base
                 .roots
                 .iter()
-                .filter_map(|c| super::fingerprint(&*c))
+                .filter_map(|c| super::fingerprint(c))
                 .collect::<Vec<_>>(),
             "Configuring connector roots",
         );
@@ -132,11 +131,11 @@ impl Creds {
 
         if let Some(certs) = &self.certs {
             tracing::debug!(
-                cert = ?super::fingerprint(&*certs.leaf),
+                cert = ?super::fingerprint(&certs.leaf),
                 intermediates = %certs.intermediates.len(),
                 "Configuring connector certificate",
             );
-            conn.set_private_key(&self.base.key)?;
+            conn.set_private_key(&certs.key)?;
             conn.set_certificate(&certs.leaf)?;
             conn.check_private_key()?;
             for c in &certs.intermediates {
@@ -146,7 +145,7 @@ impl Creds {
 
         if !alpn_protocols.is_empty() {
             let p = serialize_alpn(alpn_protocols)?;
-            conn.set_alpn_protos(&*p)?;
+            conn.set_alpn_protos(&p)?;
         }
 
         Ok(conn.build())

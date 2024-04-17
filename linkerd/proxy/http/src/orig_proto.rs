@@ -1,12 +1,11 @@
 use super::{h1, h2, upgrade};
-use futures::{future, prelude::*};
+use futures::prelude::*;
 use http::header::{HeaderValue, TRANSFER_ENCODING};
 use hyper::body::HttpBody;
 use linkerd_error::{Error, Result};
 use linkerd_http_box::BoxBody;
 use linkerd_stack::{layer, MakeConnection, Service};
 use std::{
-    future::Future,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -38,6 +37,10 @@ pub struct UpgradeResponseBody {
 pub struct Downgrade<S> {
     inner: S,
 }
+
+/// Extension that indicates a request was an orig-proto upgrade.
+#[derive(Clone, Debug)]
+pub struct WasUpgrade(());
 
 // === impl Upgrade ===
 
@@ -227,7 +230,7 @@ impl HttpBody for UpgradeResponseBody {
 // === impl Downgrade ===
 
 impl<S> Downgrade<S> {
-    pub fn layer() -> impl layer::Layer<S, Service = Self> + Copy + Clone {
+    pub fn layer() -> impl layer::Layer<S, Service = Self> + Copy {
         layer::mk(|inner| Self { inner })
     }
 }
@@ -266,6 +269,7 @@ where
                 if was_absolute_form(val) {
                     req.extensions_mut().insert(h1::WasAbsoluteForm(()));
                 }
+                req.extensions_mut().insert(WasUpgrade(()));
                 upgrade_response = true;
             }
         }

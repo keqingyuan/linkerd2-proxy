@@ -1,11 +1,9 @@
 //! A middleware that recovers a resolution after some failures.
 
-use futures::stream::TryStream;
-use futures::{prelude::*, ready, FutureExt, Stream};
+use futures::{prelude::*, ready};
 use linkerd_error::{Error, Recover};
 use linkerd_proxy_core::resolve::{self, Update};
 use pin_project::pin_project;
-use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use thiserror::Error;
@@ -84,8 +82,8 @@ where
     type Future = ResolveFuture<T, E, R>;
 
     #[inline]
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.resolve.poll_ready(cx).map_err(Into::into)
+    fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
     }
 
     #[inline]
@@ -147,7 +145,7 @@ where
     type Item = Result<Update<R::Endpoint>, Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut this = self.project();
+        let this = self.project();
         loop {
             // XXX(eliza): note that this match was originally an `if let`,
             // but that doesn't work with `#[project]` for some kinda reason
@@ -220,7 +218,6 @@ where
                 // backoff in case this connection attempt fails.
                 State::Disconnected { ref mut backoff } => {
                     tracing::trace!("connecting");
-                    ready!(self.resolve.poll_ready(cx).map_err(Into::into))?;
                     let future = self.resolve.resolve(self.target.clone());
                     let backoff = backoff.take();
                     State::Connecting { future, backoff }

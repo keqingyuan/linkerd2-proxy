@@ -1,14 +1,11 @@
 use super::*;
-use linkerd_app_core::proxy::http::trace;
+use linkerd_app_core::proxy::http::TracingExecutor;
 use parking_lot::Mutex;
 use std::io;
-use std::{convert::TryFrom, sync::Arc};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_rustls::rustls::{self, ClientConfig};
 use tracing::info_span;
-use tracing::instrument::Instrument;
 
 type ClientError = hyper::Error;
 type Request = http::Request<hyper::Body>;
@@ -255,7 +252,7 @@ fn run(
     let work = async move {
         let client = hyper::Client::builder()
             .http2_only(http2_only)
-            .executor(trace::Executor::new())
+            .executor(TracingExecutor)
             .build::<Conn, hyper::Body>(conn);
         tracing::trace!("client task started");
         let mut rx = rx;

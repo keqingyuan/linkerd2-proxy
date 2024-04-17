@@ -1,12 +1,8 @@
 //! The main entrypoint for the proxy.
 
-#![deny(
-    warnings,
-    rust_2018_idioms,
-    clippy::disallowed_methods,
-    clippy::disallowed_types
-)]
+#![deny(rust_2018_idioms, clippy::disallowed_methods, clippy::disallowed_types)]
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 
 // Emit a compile-time error if no TLS implementations are enabled. When adding
 // new implementations, add their feature flags here!
@@ -15,10 +11,10 @@ compile_error!(
     "at least one of the following TLS implementations must be enabled: 'meshtls-boring', 'meshtls-rustls'"
 );
 
-use linkerd_app::{core::transport::BindTcp, trace, Config};
+use linkerd_app::{trace, BindTcp, Config, BUILD_INFO};
 use linkerd_signal as signal;
-use tokio::sync::mpsc;
-pub use tracing::{debug, error, info, warn};
+use tokio::{sync::mpsc, time};
+use tracing::{debug, info, warn};
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64", target_env = "gnu"))]
 #[global_allocator]
@@ -29,13 +25,24 @@ mod rt;
 const EX_USAGE: i32 = 64;
 
 fn main() {
-    let trace = match trace::init() {
+    let trace = match trace::Settings::from_env().init() {
         Ok(t) => t,
         Err(e) => {
             eprintln!("Invalid logging configuration: {}", e);
             std::process::exit(EX_USAGE);
         }
     };
+
+    info!(
+        "{profile} {version} ({sha}) by {vendor} on {date}",
+        date = BUILD_INFO.date,
+        sha = BUILD_INFO.git_sha,
+        version = BUILD_INFO.version,
+        profile = BUILD_INFO.profile,
+        vendor = BUILD_INFO.vendor,
+    );
+
+    let metrics = linkerd_metrics::prom::Registry::default();
 
     // Load configuration from the environment without binding ports.
     let config = match Config::try_from_env() {
@@ -51,9 +58,11 @@ fn main() {
     // by cgroups, when possible).
     rt::build().block_on(async move {
         let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel();
+        let shutdown_grace_period = config.shutdown_grace_period;
+
         let bind = BindTcp::with_orig_dst();
         let app = match config
-            .build(bind, bind, BindTcp::default(), shutdown_tx, trace)
+            .build(bind, bind, BindTcp::default(), shutdown_tx, trace, metrics)
             .await
         {
             Ok(app) => app,
@@ -72,14 +81,9 @@ fn main() {
             Some(addr) => info!("Tap interface on {}", addr),
         }
 
-        info!("Local identity is {}", app.local_identity());
-        let addr = app.identity_addr();
-        match addr.identity.value() {
-            None => info!("Identity verified via {}", addr.addr),
-            Some(tls) => {
-                info!("Identity verified via {} ({})", addr.addr, tls.server_id);
-            }
-        }
+        // TODO distinguish ServerName and Identity.
+        info!("SNI is {}", app.local_server_name());
+        info!("Local identity is {}", app.local_tls_id());
 
         let dst_addr = app.dst_addr();
         match dst_addr.identity.value() {
@@ -111,6 +115,11 @@ fn main() {
                 info!("Received shutdown via admin interface");
             }
         }
-        drain.drain().await;
+        match time::timeout(shutdown_grace_period, drain.drain()).await {
+            Ok(()) => debug!("Shutdown completed gracefully"),
+            Err(_) => warn!(
+                "Graceful shutdown did not complete in {shutdown_grace_period:?}, terminating now"
+            ),
+        }
     });
 }

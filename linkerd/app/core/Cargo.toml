@@ -19,9 +19,19 @@ http = "0.2"
 http-body = "0.4"
 hyper = { version = "0.14", features = ["http1", "http2"] }
 futures = { version = "0.3", default-features = false }
-ipnet = "2.4"
+ipnet = "2.7"
+prometheus-client = "0.22"
+regex = "1"
+serde_json = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "sync", "parking_lot"] }
+tokio-stream = { version = "0.1", features = ["time"] }
+tonic = { version = "0.10", default-features = false, features = ["prost"] }
+tracing = "0.1"
+parking_lot = "0.12"
+pin-project = "1"
+
 linkerd-addr = { path = "../../addr" }
-linkerd-cache = { path = "../../cache" }
 linkerd-conditional = { path = "../../conditional" }
 linkerd-dns = { path = "../../dns" }
 linkerd-detect = { path = "../../detect" }
@@ -30,24 +40,28 @@ linkerd-errno = { path = "../../errno" }
 linkerd-error = { path = "../../error" }
 linkerd-error-respond = { path = "../../error-respond" }
 linkerd-exp-backoff = { path = "../../exp-backoff" }
-linkerd-http-classify = { path = "../../http-classify" }
-linkerd-http-metrics = { path = "../../http-metrics" }
+linkerd-http-metrics = { path = "../../http/metrics" }
 linkerd-identity = { path = "../../identity" }
+linkerd-idle-cache = { path = "../../idle-cache" }
 linkerd-io = { path = "../../io" }
 linkerd-meshtls = { path = "../../meshtls", default-features = false }
-linkerd-metrics = { path = "../../metrics", features = ["linkerd-stack"] }
+linkerd-metrics = { path = "../../metrics", features = ["process", "stack"] }
 linkerd-opencensus = { path = "../../opencensus" }
-linkerd-proxy-core = { path = "../../proxy/core" }
 linkerd-proxy-api-resolve = { path = "../../proxy/api-resolve" }
-linkerd-proxy-discover = { path = "../../proxy/discover" }
-linkerd-proxy-identity-client = { path = "../../proxy/identity-client" }
-linkerd-proxy-http = { path = "../../proxy/http" }
-linkerd-proxy-resolve = { path = "../../proxy/resolve" }
+linkerd-proxy-balance = { path = "../../proxy/balance" }
+linkerd-proxy-core = { path = "../../proxy/core" }
+linkerd-proxy-client-policy = { path = "../../proxy/client-policy" }
 linkerd-proxy-dns-resolve = { path = "../../proxy/dns-resolve" }
+linkerd-proxy-http = { path = "../../proxy/http" }
+linkerd-proxy-identity-client = { path = "../../proxy/identity-client" }
+linkerd-proxy-spire-client = { path = "../../proxy/spire-client" }
+linkerd-proxy-resolve = { path = "../../proxy/resolve" }
+linkerd-proxy-server-policy = { path = "../../proxy/server-policy" }
 linkerd-proxy-tap = { path = "../../proxy/tap" }
 linkerd-proxy-tcp = { path = "../../proxy/tcp" }
 linkerd-proxy-transport = { path = "../../proxy/transport" }
 linkerd-reconnect = { path = "../../reconnect" }
+linkerd-router = { path = "../../router" }
 linkerd-service-profiles = { path = "../../service-profiles" }
 linkerd-stack = { path = "../../stack" }
 linkerd-stack-metrics = { path = "../../stack/metrics" }
@@ -57,30 +71,17 @@ linkerd-transport-header = { path = "../../transport-header" }
 linkerd-transport-metrics = { path = "../../transport-metrics" }
 linkerd-tls = { path = "../../tls" }
 linkerd-trace-context = { path = "../../trace-context" }
-regex = "1"
-serde_json = "1"
-thiserror = "1"
-tokio = { version = "1", features = ["macros", "sync", "parking_lot"] }
-tokio-stream = { version = "0.1", features = ["time"] }
-tonic = { version = "0.6", default-features = false, features = ["prost"] }
-tracing = "0.1"
-parking_lot = "0.12"
-pin-project = "1"
 
 [dependencies.tower]
 version = "0.4"
 default-features = false
-features = [
-    "buffer",
-    "make",
-    "spawn-ready",
-    "timeout",
-    "util",
-    "limit",
-]
+features = ["make", "spawn-ready", "timeout", "util", "limit"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 linkerd-system = { path = "../../system" }
+
+[build-dependencies]
+semver = "1"
 
 [dev-dependencies]
 quickcheck = { version = "1", default-features = false }

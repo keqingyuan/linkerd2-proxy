@@ -1,9 +1,10 @@
-use crate::{proto, LookupAddr, Profile, Receiver};
+use crate::{proto, LookupAddr, Profile, Receiver, RecoverDefault};
 use futures::prelude::*;
 use http_body::Body;
 use linkerd2_proxy_api::destination::{self as api, destination_client::DestinationClient};
 use linkerd_error::{Infallible, Recover};
 use linkerd_stack::{Param, Service};
+use linkerd_tonic_stream::{LimitReceiveFuture, ReceiveLimits};
 use linkerd_tonic_watch::StreamWatch;
 use std::{
     sync::Arc,
@@ -23,6 +24,7 @@ pub struct Client<R, S> {
 struct Inner<S> {
     client: DestinationClient<S>,
     context_token: Arc<str>,
+    limits: ReceiveLimits,
 }
 
 // === impl Client ===
@@ -31,17 +33,31 @@ impl<R, S> Client<R, S>
 where
     S: GrpcService<BoxBody> + Clone + Send + 'static,
     S::ResponseBody: Send + Sync,
-    <S::ResponseBody as Body>::Data: Send,
+    S::ResponseBody: Default + Body<Data = tonic::codegen::Bytes> + Send + 'static,
     <S::ResponseBody as Body>::Error:
         Into<Box<dyn std::error::Error + Send + Sync + 'static>> + Send,
     S::Future: Send,
     R: Recover<tonic::Status> + Send + Clone + 'static,
     R::Backoff: Unpin + Send,
 {
-    pub fn new(recover: R, inner: S, context_token: impl Into<Arc<str>>) -> Self {
+    pub fn new(
+        recover: R,
+        inner: S,
+        context_token: impl Into<Arc<str>>,
+        limits: ReceiveLimits,
+    ) -> Self {
         Self {
-            watch: StreamWatch::new(recover, Inner::new(context_token.into(), inner)),
+            watch: StreamWatch::new(recover, Inner::new(context_token.into(), limits, inner)),
         }
+    }
+
+    pub fn new_recover_default(
+        recover: R,
+        inner: S,
+        context_token: impl Into<Arc<str>>,
+        limits: ReceiveLimits,
+    ) -> RecoverDefault<Self> {
+        RecoverDefault::new(Self::new(recover, inner, context_token, limits))
     }
 }
 
@@ -49,8 +65,7 @@ impl<T, R, S> Service<T> for Client<R, S>
 where
     T: Param<LookupAddr>,
     S: GrpcService<BoxBody> + Clone + Send + 'static,
-    S::ResponseBody: Send + Sync,
-    <S::ResponseBody as Body>::Data: Send,
+    S::ResponseBody: Default + Body<Data = tonic::codegen::Bytes> + Send + 'static,
     <S::ResponseBody as Body>::Error:
         Into<Box<dyn std::error::Error + Send + Sync + 'static>> + Send,
     S::Future: Send,
@@ -75,6 +90,7 @@ where
             match w.spawn_watch(addr).await {
                 Ok(rsp) => {
                     let rx = rsp.into_inner();
+                    debug!(profile = ?*rx.borrow(), "Resolved profile");
                     Ok(Some(rx.into()))
                 }
                 Err(status) => {
@@ -96,15 +112,15 @@ type InnerFuture =
 impl<S> Inner<S>
 where
     S: GrpcService<BoxBody> + Clone + Send + 'static,
-    S::ResponseBody: Send + Sync,
-    <S::ResponseBody as Body>::Data: Send,
+    S::ResponseBody: Default + Body<Data = tonic::codegen::Bytes> + Send + 'static,
     <S::ResponseBody as Body>::Error:
         Into<Box<dyn std::error::Error + Send + Sync + 'static>> + Send,
     S::Future: Send,
 {
-    fn new(context_token: Arc<str>, inner: S) -> Self {
+    fn new(context_token: Arc<str>, limits: ReceiveLimits, inner: S) -> Self {
         Self {
             context_token,
+            limits,
             client: DestinationClient::new(inner),
         }
     }
@@ -113,8 +129,7 @@ where
 impl<S> Service<LookupAddr> for Inner<S>
 where
     S: GrpcService<BoxBody> + Clone + Send + 'static,
-    S::ResponseBody: Send + Sync,
-    <S::ResponseBody as Body>::Data: Send,
+    S::ResponseBody: Default + Body<Data = tonic::codegen::Bytes> + Send + 'static,
     <S::ResponseBody as Body>::Error:
         Into<Box<dyn std::error::Error + Send + Sync + 'static>> + Send,
     S::Future: Send,
@@ -136,12 +151,15 @@ where
             ..Default::default()
         };
 
+        // TODO(ver): Record metrics on requests/errors/etc per addr.
         let mut client = self.client.clone();
+        let limits = self.limits;
+        let port = addr.port();
         Box::pin(async move {
-            let rsp = client.get_profile(req).await?;
-            Ok(rsp.map(|s| {
-                Box::pin(s.map_ok(move |p| proto::convert_profile(p, addr.port()))) as InnerStream
-            }))
+            // Limit the amount of time we spend waiting for the first
+            // profile update.
+            let rsp = LimitReceiveFuture::new(limits, client.get_profile(req)).await?;
+            Ok(rsp.map(move |rsp| rsp.map_ok(move |p| proto::convert_profile(p, port)).boxed()))
         })
     }
 }

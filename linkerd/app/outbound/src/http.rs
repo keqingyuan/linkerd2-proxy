@@ -1,211 +1,148 @@
-pub mod detect;
+use self::require_id_header::NewRequireIdentity;
+use crate::Outbound;
+use linkerd_app_core::{
+    metrics::prom,
+    proxy::{
+        api_resolve::{ConcreteAddr, Metadata},
+        core::Resolve,
+    },
+    svc,
+    transport::addrs::*,
+    Error,
+};
+use std::{fmt::Debug, hash::Hash};
+use tokio::sync::watch;
+
+mod breaker;
+pub mod concrete;
 mod endpoint;
+mod handle_proxy_error_headers;
 pub mod logical;
-mod proxy_connection_close;
 mod require_id_header;
 mod retry;
 mod server;
-mod strip_proxy_error;
 
-use self::{
-    proxy_connection_close::ProxyConnectionClose, require_id_header::NewRequireIdentity,
-    strip_proxy_error::NewStripProxyError,
-};
-pub(crate) use self::{require_id_header::IdentityRequired, server::ServerRescue};
-use crate::tcp;
-pub use linkerd_app_core::proxy::http::*;
-use linkerd_app_core::{
-    classify, metrics,
-    profiles::{self, LogicalAddr},
-    proxy::{api_resolve::ProtocolHint, tap},
-    svc::Param,
-    tls, Addr, Conditional, CANONICAL_DST_HEADER,
-};
-use std::{net::SocketAddr, str::FromStr};
-
-pub type Accept = crate::Accept<Version>;
-pub type Logical = crate::logical::Logical<Version>;
-pub type Concrete = crate::logical::Concrete<Version>;
-pub type Endpoint = crate::endpoint::Endpoint<Version>;
-
-pub type Connect = self::endpoint::Connect<Endpoint>;
+pub use self::logical::{policy, profile, LogicalAddr, Routes};
+pub(crate) use self::require_id_header::IdentityRequired;
+pub use linkerd_app_core::proxy::http::{self as http, *};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct Route {
-    logical: Logical,
-    route: profiles::http::Route,
+pub struct Http<T>(T);
+
+#[derive(Clone, Debug, Default)]
+pub struct HttpMetrics {
+    balancer: concrete::BalancerMetrics,
+    http_route: policy::RouteMetrics,
+    grpc_route: policy::RouteMetrics,
 }
 
-#[derive(Clone, Debug)]
-pub struct CanonicalDstHeader(pub Addr);
+pub fn spawn_routes<T>(
+    mut route_rx: watch::Receiver<T>,
+    init: Routes,
+    mut mk: impl FnMut(&T) -> Option<Routes> + Send + Sync + 'static,
+) -> watch::Receiver<Routes>
+where
+    T: Send + Sync + 'static,
+{
+    let (tx, rx) = watch::channel(init);
 
-// === impl CanonicalDstHeader ===
+    tokio::spawn(async move {
+        loop {
+            let res = tokio::select! {
+                biased;
+                _ = tx.closed() => return,
+                res = route_rx.changed() => res,
+            };
 
-impl From<CanonicalDstHeader> for HeaderPair {
-    fn from(CanonicalDstHeader(dst): CanonicalDstHeader) -> HeaderPair {
-        HeaderPair(
-            HeaderName::from_static(CANONICAL_DST_HEADER),
-            HeaderValue::from_str(&dst.to_string()).expect("addr must be a valid header"),
-        )
+            if res.is_err() {
+                // Drop the `tx` sender when the profile sender is
+                // dropped.
+                return;
+            }
+
+            if let Some(routes) = (mk)(&*route_rx.borrow_and_update()) {
+                if tx.send(routes).is_err() {
+                    // Drop the `tx` sender when all of its receivers are dropped.
+                    return;
+                }
+            }
+        }
+    });
+
+    rx
+}
+
+pub fn spawn_routes_default(addr: Remote<ServerAddr>) -> watch::Receiver<Routes> {
+    let (tx, rx) = watch::channel(Routes::Endpoint(addr, Default::default()));
+    tokio::spawn(async move {
+        tx.closed().await;
+    });
+    rx
+}
+
+// === impl Outbound ===
+
+impl<T> Outbound<svc::ArcNewHttp<concrete::Endpoint<logical::Concrete<Http<T>>>>> {
+    /// Builds a stack that routes HTTP requests to endpoint stacks.
+    ///
+    /// Buffered concrete services are cached in and evicted when idle.
+    pub fn push_http_cached<R>(self, resolve: R) -> Outbound<svc::ArcNewCloneHttp<T>>
+    where
+        // Logical HTTP target.
+        T: svc::Param<http::Version>,
+        T: svc::Param<watch::Receiver<Routes>>,
+        T: Clone + Debug + PartialEq + Eq + Hash + Send + Sync + 'static,
+        // Endpoint resolution.
+        R: Resolve<ConcreteAddr, Endpoint = Metadata, Error = Error>,
+        R::Resolution: Unpin,
+    {
+        self.push_http_endpoint()
+            .push_http_concrete(resolve)
+            .push_http_logical()
+            .map_stack(move |config, _, stk| {
+                stk.push_new_idle_cached(config.discovery_idle_timeout)
+                    .push_map_target(Http)
+                    .arc_new_clone_http()
+            })
     }
 }
 
-// === impl Accept ===
+// === impl Http ===
 
-impl Param<Version> for Accept {
-    fn param(&self) -> Version {
-        self.protocol
+impl<T> svc::Param<http::Version> for Http<T>
+where
+    T: svc::Param<http::Version>,
+{
+    fn param(&self) -> http::Version {
+        self.0.param()
     }
 }
 
-impl Param<normalize_uri::DefaultAuthority> for Accept {
-    fn param(&self) -> normalize_uri::DefaultAuthority {
-        normalize_uri::DefaultAuthority(Some(
-            uri::Authority::from_str(&self.orig_dst.to_string())
-                .expect("Address must be a valid authority"),
-        ))
+impl<T> svc::Param<watch::Receiver<Routes>> for Http<T>
+where
+    T: svc::Param<watch::Receiver<Routes>>,
+{
+    fn param(&self) -> watch::Receiver<Routes> {
+        self.0.param()
     }
 }
 
-// === impl Logical ===
+// === impl HttpMetrics ===
 
-impl From<(Version, tcp::Logical)> for Logical {
-    fn from((protocol, logical): (Version, tcp::Logical)) -> Self {
+impl HttpMetrics {
+    pub fn register(registry: &mut prom::Registry) -> Self {
+        let http = registry.sub_registry_with_prefix("http");
+        let http_route = policy::RouteMetrics::register(http.sub_registry_with_prefix("route"));
+        let balancer =
+            concrete::BalancerMetrics::register(http.sub_registry_with_prefix("balancer"));
+
+        let grpc = registry.sub_registry_with_prefix("grpc");
+        let grpc_route = policy::RouteMetrics::register(grpc.sub_registry_with_prefix("route"));
+
         Self {
-            protocol,
-            profile: logical.profile,
-            logical_addr: logical.logical_addr,
+            balancer,
+            http_route,
+            grpc_route,
         }
-    }
-}
-
-impl Param<CanonicalDstHeader> for Logical {
-    fn param(&self) -> CanonicalDstHeader {
-        CanonicalDstHeader(self.addr())
-    }
-}
-
-impl Param<Version> for Logical {
-    fn param(&self) -> Version {
-        self.protocol
-    }
-}
-
-impl Param<normalize_uri::DefaultAuthority> for Logical {
-    fn param(&self) -> normalize_uri::DefaultAuthority {
-        normalize_uri::DefaultAuthority(Some(
-            uri::Authority::from_str(&self.logical_addr.to_string())
-                .expect("Address must be a valid authority"),
-        ))
-    }
-}
-
-// === impl Endpoint ===
-
-impl From<(Version, tcp::Endpoint)> for Endpoint {
-    fn from((protocol, ep): (Version, tcp::Endpoint)) -> Self {
-        Self {
-            protocol,
-            addr: ep.addr,
-            tls: ep.tls,
-            metadata: ep.metadata,
-            logical_addr: ep.logical_addr,
-            // If we know an HTTP version, the protocol must not be opaque.
-            opaque_protocol: false,
-        }
-    }
-}
-
-impl Param<normalize_uri::DefaultAuthority> for Endpoint {
-    fn param(&self) -> normalize_uri::DefaultAuthority {
-        if let Some(LogicalAddr(ref a)) = self.logical_addr {
-            normalize_uri::DefaultAuthority(Some(
-                uri::Authority::from_str(&a.to_string())
-                    .expect("Address must be a valid authority"),
-            ))
-        } else {
-            normalize_uri::DefaultAuthority(Some(
-                uri::Authority::from_str(&self.addr.to_string())
-                    .expect("Address must be a valid authority"),
-            ))
-        }
-    }
-}
-
-impl Param<Version> for Endpoint {
-    fn param(&self) -> Version {
-        self.protocol
-    }
-}
-
-impl Param<client::Settings> for Endpoint {
-    fn param(&self) -> client::Settings {
-        match self.protocol {
-            Version::H2 => client::Settings::H2,
-            Version::Http1 => match self.metadata.protocol_hint() {
-                ProtocolHint::Unknown => client::Settings::Http1,
-                ProtocolHint::Http2 => client::Settings::OrigProtoUpgrade,
-            },
-        }
-    }
-}
-
-impl tap::Inspect for Endpoint {
-    fn src_addr<B>(&self, req: &Request<B>) -> Option<SocketAddr> {
-        req.extensions().get::<ClientHandle>().map(|c| c.addr)
-    }
-
-    fn src_tls<B>(&self, _: &Request<B>) -> tls::ConditionalServerTls {
-        Conditional::None(tls::NoServerTls::Loopback)
-    }
-
-    fn dst_addr<B>(&self, _: &Request<B>) -> Option<SocketAddr> {
-        Some(self.addr.into())
-    }
-
-    fn dst_labels<B>(&self, _: &Request<B>) -> Option<tap::Labels> {
-        Some(self.metadata.labels())
-    }
-
-    fn dst_tls<B>(&self, _: &Request<B>) -> tls::ConditionalClientTls {
-        self.tls.clone()
-    }
-
-    fn route_labels<B>(&self, req: &Request<B>) -> Option<tap::Labels> {
-        req.extensions()
-            .get::<profiles::http::Route>()
-            .map(|r| r.labels().clone())
-    }
-
-    fn is_outbound<B>(&self, _: &Request<B>) -> bool {
-        true
-    }
-}
-
-// === impl Route ===
-
-impl Param<profiles::http::Route> for Route {
-    fn param(&self) -> profiles::http::Route {
-        self.route.clone()
-    }
-}
-
-impl Param<metrics::RouteLabels> for Route {
-    fn param(&self) -> metrics::RouteLabels {
-        metrics::RouteLabels::outbound(self.logical.logical_addr.clone(), &self.route)
-    }
-}
-
-impl Param<ResponseTimeout> for Route {
-    fn param(&self) -> ResponseTimeout {
-        ResponseTimeout(self.route.timeout())
-    }
-}
-
-impl classify::CanClassify for Route {
-    type Classify = classify::Request;
-
-    fn classify(&self) -> classify::Request {
-        self.route.response_classes().clone().into()
     }
 }

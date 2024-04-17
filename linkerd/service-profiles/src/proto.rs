@@ -20,7 +20,7 @@ pub(super) fn convert_profile(proto: api::DestinationProfile, port: u16) -> Prof
         .dst_overrides
         .into_iter()
         .filter_map(convert_dst_override)
-        .collect();
+        .collect::<Arc<[_]>>();
     let endpoint = proto.endpoint.and_then(|e| {
         let labels = std::collections::HashMap::new();
         resolve::to_addr_meta(e, &labels)
@@ -77,13 +77,16 @@ fn set_route_retry(route: &mut http::Route, retry_budget: Option<&Arc<Budget>>) 
     route.set_retries(budget);
 }
 
-fn set_route_timeout(route: &mut http::Route, timeout: Result<Duration, Duration>) {
+fn set_route_timeout(
+    route: &mut http::Route,
+    timeout: Result<Duration, prost_types::DurationError>,
+) {
     match timeout {
         Ok(dur) => {
             route.set_timeout(dur);
         }
-        Err(_) => {
-            warn!("route timeout is negative: {:?}", route);
+        Err(error) => {
+            warn!(%error, "error setting timeout for route");
         }
     }
 }
@@ -113,10 +116,10 @@ fn convert_req_match(orig: api::RequestMatch) -> Option<http::RequestMatch> {
                     Regex::new(&re).ok()?
                 }
             };
-            http::RequestMatch::Path(Box::new(re))
+            http::RequestMatch::Path(re.into())
         }
         api::request_match::Match::Method(mm) => {
-            let m = mm.r#type.and_then(|m| (&m).try_into().ok())?;
+            let m = mm.r#type.and_then(|m| m.try_into().ok())?;
             http::RequestMatch::Method(m)
         }
     };
@@ -168,7 +171,7 @@ fn convert_rsp_match(orig: api::ResponseMatch) -> Option<http::ResponseMatch> {
 }
 
 fn convert_retry_budget(orig: api::RetryBudget) -> Option<Arc<Budget>> {
-    let min_retries = if orig.min_retries_per_second <= ::std::i32::MAX as u32 {
+    let min_retries = if orig.min_retries_per_second <= i32::MAX as u32 {
         orig.min_retries_per_second
     } else {
         warn!(

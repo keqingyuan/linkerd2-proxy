@@ -1,11 +1,6 @@
 //! Shared infrastructure for integration tests
 
-#![deny(
-    warnings,
-    rust_2018_idioms,
-    clippy::disallowed_methods,
-    clippy::disallowed_types
-)]
+#![deny(rust_2018_idioms, clippy::disallowed_methods, clippy::disallowed_types)]
 #![forbid(unsafe_code)]
 
 pub use futures::{future, FutureExt, TryFuture, TryFutureExt};
@@ -37,6 +32,11 @@ pub fn resolver<E>() -> resolver::Dst<E> {
 
 pub fn profiles() -> resolver::Profiles {
     profile::resolver()
+}
+
+#[cfg(feature = "client-policy")]
+pub fn client_policies() -> resolver::ClientPolicies {
+    resolver::Resolver::default()
 }
 
 pub fn connect<E>() -> connect::Connect<E> {

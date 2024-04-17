@@ -43,7 +43,8 @@ impl Config {
         self,
         identity: identity::NewClient,
         dns: dns::Resolver,
-        metrics: metrics::Registry,
+        legacy_metrics: metrics::Registry,
+        control_metrics: control::Metrics,
         client_metrics: HttpMetrics,
     ) -> Result<OcCollector, Error> {
         match self {
@@ -52,7 +53,7 @@ impl Config {
                 let addr = inner.control.addr.clone();
                 let svc = inner
                     .control
-                    .build(dns, client_metrics, identity)
+                    .build(dns, client_metrics, control_metrics, identity)
                     .new_service(());
 
                 let (span_sink, spans_rx) = mpsc::channel(Self::SPAN_BUFFER_CAPACITY);
@@ -76,7 +77,7 @@ impl Config {
 
                     let addr = addr.clone();
                     Box::pin(
-                        opencensus::export_spans(svc, node, spans_rx, metrics).instrument(
+                        opencensus::export_spans(svc, node, spans_rx, legacy_metrics).instrument(
                             tracing::debug_span!("opencensus", peer.addr = %addr).or_current(),
                         ),
                     )

@@ -1,67 +1,54 @@
-# syntax=docker/dockerfile:experimental
+# syntax=docker/dockerfile:1.4
 
-# Proxy build and runtime
-#
 # This is intended **DEVELOPMENT ONLY**, i.e. so that proxy developers can
 # easily test the proxy in the context of the larger `linkerd2` project.
-#
-# This Dockerfile requires expirmental features to be enabled in both the
-# Docker client and daemon. You MUST use buildkit to build this image. The
-# simplest way to do this is to set the `DOCKER_BUILDKIT` environment variable:
-#
-#     :; DOCKER_BUILDKIT=1 docker build .
-#
-# Alternatively, you can use `buildx`, which supports more complicated build
-# configurations:
-#
-#     :; docker buildx build . --load
 
-# Please make changes via update-rust-version.sh
-ARG RUST_VERSION=1.59.0
-ARG RUST_IMAGE=rust:${RUST_VERSION}-buster
+ARG RUST_IMAGE=ghcr.io/linkerd/dev:v43-rust
 
 # Use an arbitrary ~recent edge release image to get the proxy
 # identity-initializing and linkerd-await wrappers.
-ARG RUNTIME_IMAGE=ghcr.io/linkerd/proxy:edge-22.2.1
+ARG LINKERD2_IMAGE=ghcr.io/linkerd/proxy:edge-23.11.2
 
-# Build the proxy, leveraging (new, experimental) cache mounting.
-#
-# See: https://github.com/moby/buildkit/blob/master/frontend/dockerfile/docs/experimental.md#run---mounttypecache
-FROM $RUST_IMAGE as build
+FROM $LINKERD2_IMAGE as linkerd2
 
-# When set, causes the proxy to be compiled in development mode.
-ARG PROXY_UNOPTIMIZED
+FROM --platform=$BUILDPLATFORM $RUST_IMAGE as fetch
 
-# Controls what features are enabled in the proxy.
-ARG PROXY_FEATURES="multicore,meshtls-rustls"
+ARG PROXY_FEATURES=""
+RUN apt-get update && \
+    apt-get install -y time && \
+    if [[ "$PROXY_FEATURES" =~ .*meshtls-boring.* ]] ; then \
+      apt-get install -y golang ; \
+    fi && \
+    rm -rf /var/lib/apt/lists/*
 
-RUN --mount=type=cache,target=/var/lib/apt/lists \
-    --mount=type=cache,target=/var/tmp \
-  apt update && apt install -y time
+ENV CARGO_NET_RETRY=10
+ENV RUSTUP_MAX_RETRIES=10
 
-RUN --mount=type=cache,target=/var/lib/apt/lists \
-    --mount=type=cache,target=/var/tmp \
-  if $(echo "$PROXY_FEATURES" | grep "meshtls-boring" >/dev/null); then \
-    apt install -y cmake clang golang ; \
-  fi
-
-WORKDIR /usr/src/linkerd2-proxy
+WORKDIR /src
 COPY . .
-RUN --mount=type=cache,target=target \
-    --mount=type=cache,from=rust:1.59.0-buster,source=/usr/local/cargo,target=/usr/local/cargo \
-  mkdir -p /out && \
-  if [ -n "$PROXY_UNOPTIMIZED" ]; then \
-    (cd linkerd2-proxy && /usr/bin/time -v cargo build --locked --no-default-features --features="$PROXY_FEATURES") && \
-    mv target/debug/linkerd2-proxy /out/linkerd2-proxy ; \
-  else \
-    (cd linkerd2-proxy && /usr/bin/time -v cargo build --locked --no-default-features --features="$PROXY_FEATURES" --release) && \
-    mv target/release/linkerd2-proxy /out/linkerd2-proxy ; \
-  fi
+RUN --mount=type=cache,id=cargo,target=/usr/local/cargo/registry \
+    just fetch
 
-## Install the proxy binary into the base runtime image.
-FROM $RUNTIME_IMAGE as runtime
+# Build the proxy.
+FROM fetch as build
+ENV CARGO_INCREMENTAL=0
+ENV RUSTFLAGS="-D warnings -A deprecated"
+ARG TARGETARCH="amd64"
+ARG PROFILE="release"
+ARG LINKERD2_PROXY_VERSION=""
+ARG LINKERD2_PROXY_VENDOR=""
+SHELL ["/bin/bash", "-c"]
+RUN --mount=type=cache,id=cargo,target=/usr/local/cargo/registry \
+    if [[ "$PROXY_FEATURES" =~ .*pprof.* ]] ; then cmd=build-debug ; else cmd=build ; fi ; \
+    /usr/bin/time -v just arch="$TARGETARCH" features="$PROXY_FEATURES" profile="$PROFILE" "$cmd" && \
+    ( mkdir -p /out ; \
+        mv $(just --evaluate profile="$PROFILE" _target_bin) /out/ ; \
+        du -sh /out/* )
 
+# Install the proxy binary into a base image that we can at least get a shell
+# for debugging.
+FROM docker.io/library/debian:bookworm-slim as runtime
 WORKDIR /linkerd
-COPY --from=build /out/linkerd2-proxy /usr/lib/linkerd/linkerd2-proxy
-ENV LINKERD2_PROXY_LOG=warn,linkerd=info
-# Inherits the ENTRYPOINT from the runtime image.
+COPY --from=linkerd2 /usr/lib/linkerd/* /usr/lib/linkerd/
+COPY --from=build /out/* /usr/lib/linkerd/
+ENTRYPOINT ["/usr/lib/linkerd/linkerd2-proxy-identity"]

@@ -1,9 +1,10 @@
 use futures::prelude::*;
-use linkerd_identity::{LocalId, Name};
+use linkerd_dns_name as dns;
 use linkerd_io as io;
+use linkerd_meshtls_verifier as verifier;
 use linkerd_stack::{Param, Service};
-use linkerd_tls::{ClientId, NegotiatedProtocol, NegotiatedProtocolRef, ServerTls};
-use std::{convert::TryFrom, pin::Pin, sync::Arc, task::Context};
+use linkerd_tls::{ClientId, NegotiatedProtocol, NegotiatedProtocolRef, ServerName, ServerTls};
+use std::{pin::Pin, sync::Arc, task::Context};
 use thiserror::Error;
 use tokio::sync::watch;
 use tokio_rustls::rustls::{Certificate, ServerConfig};
@@ -12,7 +13,7 @@ use tracing::debug;
 /// A Service that terminates TLS connections using a dynamically updated server configuration.
 #[derive(Clone)]
 pub struct Server {
-    name: Name,
+    name: dns::Name,
     rx: watch::Receiver<Arc<ServerConfig>>,
 }
 
@@ -29,7 +30,7 @@ pub struct ServerIo<I>(tokio_rustls::server::TlsStream<I>);
 pub struct LostStore(());
 
 impl Server {
-    pub(crate) fn new(name: Name, rx: watch::Receiver<Arc<ServerConfig>>) -> Self {
+    pub(crate) fn new(name: dns::Name, rx: watch::Receiver<Arc<ServerConfig>>) -> Self {
         Self { name, rx }
     }
 
@@ -49,7 +50,7 @@ impl Server {
         let mut orig_rx = self.rx;
 
         let mut c = (**orig_rx.borrow_and_update()).clone();
-        c.alpn_protocols = alpn_protocols.clone();
+        c.alpn_protocols.clone_from(&alpn_protocols);
         let (tx, rx) = watch::channel(c.into());
 
         // Spawn a background task that watches the optional server configuration and publishes it
@@ -73,7 +74,7 @@ impl Server {
                 }
 
                 let mut c = (*orig_rx.borrow().clone()).clone();
-                c.alpn_protocols = alpn_protocols.clone();
+                c.alpn_protocols.clone_from(&alpn_protocols);
                 let _ = tx.send(c.into());
             }
         });
@@ -82,9 +83,9 @@ impl Server {
     }
 }
 
-impl Param<LocalId> for Server {
-    fn param(&self) -> LocalId {
-        LocalId(self.name.clone())
+impl Param<ServerName> for Server {
+    fn param(&self) -> ServerName {
+        ServerName(self.name.clone())
     }
 }
 
@@ -129,19 +130,8 @@ fn client_identity<I>(tls: &tokio_rustls::server::TlsStream<I>) -> Option<Client
     let (_io, session) = tls.get_ref();
     let certs = session.peer_certificates()?;
     let c = certs.first().map(Certificate::as_ref)?;
-    let end_cert = webpki::EndEntityCert::try_from(c).ok()?;
-    let dns_names = end_cert.dns_names().ok()?;
 
-    match dns_names.first()? {
-        webpki::GeneralDnsNameRef::DnsName(n) => {
-            let s: &str = (*n).into();
-            s.parse().ok().map(ClientId)
-        }
-        webpki::GeneralDnsNameRef::Wildcard(_) => {
-            // Wildcards can perhaps be handled in a future path...
-            None
-        }
-    }
+    verifier::client_identity(c).map(ClientId)
 }
 
 // === impl ServerIo ===

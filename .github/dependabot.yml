@@ -11,17 +11,19 @@ updates:
     allow:
       - dependency-type: "all"
     ignore:
-      - dependency-name: "futures-channel"
-      - dependency-name: "futures-core"
-      - dependency-name: "futures-io"
-      - dependency-name: "futures-sink"
-      - dependency-name: "futures-task"
-      - dependency-name: "futures-util"
+      # These dependencies will be updated via higher-level aggregator dependencies like `clap`,
+      # `futures`, `prost`, `tracing`, and `trust-dns-resolver`:
+      - dependency-name: "futures-*"
       - dependency-name: "prost-derive"
-      - dependency-name: "tracing-attributes"
-      - dependency-name: "tracing-core"
-      - dependency-name: "tracing-serde"
+      - dependency-name: "tracing-*"
       - dependency-name: "trust-dns-proto"
+      # These dependencies are for platforms that we don't support:
+      - dependency-name: "hermit-abi"
+      - dependency-name: "redox_*"
+      - dependency-name: "js-sys"
+      - dependency-name: "wasm-bindgen"
+      - dependency-name: "web-sys"
+      - dependency-name: "windows*"
 
   - package-ecosystem: cargo
     directory: /linkerd/addr/fuzz
@@ -70,4 +72,18 @@ updates:
     schedule:
       interval: daily
       time: "10:00"
+      timezone: "UTC"
+
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: daily
+      time: "09:00"
+      timezone: "UTC"
+
+  - package-ecosystem: "docker"
+    directory: "/.devcontainer"
+    schedule:
+      interval: daily
+      time: "09:00"
       timezone: "UTC"
